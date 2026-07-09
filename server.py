@@ -27,7 +27,11 @@ from pathlib import Path
 import requests
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("ai-command-center-tools")
+mcp = FastMCP(
+    "ai-command-center-tools",
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", 8000)),
+)
 
 MAX_FILE_MB = 100
 YOUTUBE_TIKTOK_INSTAGRAM = re.compile(
@@ -173,6 +177,6 @@ async def health(request):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
     # streamable-http = بروتوكول MCP عبر HTTP، هذا ما تحتاجه genspark كسيرفر MCP خارجي (remote)
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    # ملاحظة: host/port يُقرآن من إعداد FastMCP نفسه أعلاه (وليس من run())
+    mcp.run(transport="streamable-http")
