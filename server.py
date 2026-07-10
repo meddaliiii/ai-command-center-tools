@@ -3,8 +3,8 @@ AI Command Center - External Tools MCP Server
 ------------------------------------------------
 هدف هذا السيرفر: تنفيذ العمليات التي لا يقدر نموذج اللغة ينفذها بنفسه
 (فتح روابط فيديو فعلياً، فك ضغط أرشيفات) ويرجّع بيانات حقيقية فقط.
-مصمم للنشر المجاني على Render.com (Web Service) ثم ربطه كأداة MCP خارجية
-داخل إعدادات تطبيق genspark (Tools / MCP Servers / Integrations).
+مصمم للنشر المجاني على Render.com (Web Service) ثم ربطه كأداة خارجية
+داخل إعدادات تطبيق genspark (Tools / MCP Servers / Integrations / قراءة الروابط).
 
 التشغيل محلياً للاختبار:
     pip install -r requirements.txt
@@ -42,13 +42,7 @@ YOUTUBE_TIKTOK_INSTAGRAM = re.compile(
 # ----------------------------------------------------------------------
 # أداة 1: تحليل رابط فيديو (يوتيوب / تيك توك / إنستغرام)
 # ----------------------------------------------------------------------
-@mcp.tool()
-def analyze_video_url(url: str) -> dict:
-    """
-    يجلب بيانات حقيقية عن رابط فيديو: العنوان، الوصف، القناة، المدة،
-    والترانسكريبت إن توفر (captions أو auto-captions).
-    لا يخمّن أبداً: إذا فشل الجلب يرجع success=False مع سبب واضح.
-    """
+def _analyze_video_url_impl(url: str) -> dict:
     if not YOUTUBE_TIKTOK_INSTAGRAM.search(url):
         return {"success": False, "error": "الرابط غير مدعوم حالياً (يوتيوب/تيك توك/إنستغرام فقط)."}
 
@@ -81,6 +75,16 @@ def analyze_video_url(url: str) -> dict:
         "transcript_available": bool(transcript_text),
         "transcript": transcript_text[:8000] if transcript_text else None,
     }
+
+
+@mcp.tool()
+def analyze_video_url(url: str) -> dict:
+    """
+    يجلب بيانات حقيقية عن رابط فيديو: العنوان، الوصف، القناة، المدة،
+    والترانسكريبت إن توفر (captions أو auto-captions).
+    لا يخمّن أبداً: إذا فشل الجلب يرجع success=False مع سبب واضح.
+    """
+    return _analyze_video_url_impl(url)
 
 
 def _extract_transcript(info: dict) -> str | None:
@@ -120,12 +124,7 @@ def _clean_subtitle_text(raw: str) -> str:
 # ----------------------------------------------------------------------
 # أداة 2: فك ضغط أرشيف (ZIP) من رابط وإرجاع محتواه الفعلي
 # ----------------------------------------------------------------------
-@mcp.tool()
-def extract_archive(file_url: str) -> dict:
-    """
-    يحمّل أرشيف ZIP من رابط ويفك ضغطه فعلياً، ويرجع قائمة الملفات
-    الداخلية مع مقتطف نصي من كل ملف نصي (حد أقصى 100MB لكل ملف).
-    """
+def _extract_archive_impl(file_url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
         zip_path = os.path.join(tmp_dir, "archive.zip")
@@ -167,16 +166,52 @@ def extract_archive(file_url: str) -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+@mcp.tool()
+def extract_archive(file_url: str) -> dict:
+    """
+    يحمّل أرشيف ZIP من رابط ويفك ضغطه فعلياً، ويرجع قائمة الملفات
+    الداخلية مع مقتطف نصي من كل ملف نصي (حد أقصى 100MB لكل ملف).
+    """
+    return _extract_archive_impl(file_url)
+
+
+# ----------------------------------------------------------------------
+# نقاط REST عادية (GET) — لتُستخدم إذا كان لدى genspark ميزة عامة
+# "قراءة رابط" تفتح أي URL وتقرأ محتواه، بدل بروتوكول MCP الكامل.
+# مثال: GET /api/analyze-video?url=https://youtu.be/xxxx
+# ----------------------------------------------------------------------
+@mcp.custom_route("/api/analyze-video", methods=["GET"])
+async def api_analyze_video(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_analyze_video_url_impl(url))
+
+
+@mcp.custom_route("/api/extract-archive", methods=["GET"])
+async def api_extract_archive(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_extract_archive_impl(url))
+
+
 # ----------------------------------------------------------------------
 # نقطة فحص صحة السيرفر (يُستخدم للتأكد أنه يعمل قبل ربطه بـ genspark)
 # ----------------------------------------------------------------------
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request):
     from starlette.responses import JSONResponse
-    return JSONResponse({"status": "ok", "tools": ["analyze_video_url", "extract_archive"]})
+    return JSONResponse({
+        "status": "ok",
+        "mcp_tools": ["analyze_video_url", "extract_archive"],
+        "rest_endpoints": ["/api/analyze-video?url=...", "/api/extract-archive?url=..."],
+    })
 
 
 if __name__ == "__main__":
     # streamable-http = بروتوكول MCP عبر HTTP، هذا ما تحتاجه genspark كسيرفر MCP خارجي (remote)
     # ملاحظة: host/port يُقرآن من إعداد FastMCP نفسه أعلاه (وليس من run())
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http") 
