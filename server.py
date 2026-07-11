@@ -3,8 +3,8 @@ AI Command Center - External Tools MCP Server
 ------------------------------------------------
 هدف هذا السيرفر: تنفيذ العمليات التي لا يقدر نموذج اللغة ينفذها بنفسه
 (فتح روابط فيديو فعلياً، فك ضغط أرشيفات) ويرجّع بيانات حقيقية فقط.
-مصمم للنشر المجاني على Render.com (Web Service) ثم ربطه كأداة خارجية
-داخل إعدادات تطبيق genspark (Tools / MCP Servers / Integrations / قراءة الروابط).
+مصمم للنشر المجاني على Render.com (Web Service) ثم ربطه كأداة MCP خارجية
+داخل إعدادات تطبيق genspark (Tools / MCP Servers / Integrations).
 
 التشغيل محلياً للاختبار:
     pip install -r requirements.txt
@@ -37,6 +37,27 @@ MAX_FILE_MB = 100
 YOUTUBE_TIKTOK_INSTAGRAM = re.compile(
     r"(youtu\.be/|youtube\.com/(watch|shorts)|tiktok\.com/|instagram\.com/reel)"
 )
+
+
+def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tuple[str | None, dict | None]:
+    """
+    يحمّل ملف من رابط لمجلد مؤقت. يرجع (المسار, None) عند النجاح
+    أو (None, {"success": False, "error": ...}) عند الفشل.
+    """
+    local_path = os.path.join(tmp_dir, "downloaded_file")
+    try:
+        r = requests.get(url, timeout=60, stream=True)
+        r.raise_for_status()
+        size = 0
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                size += len(chunk)
+                if size > max_mb * 1024 * 1024:
+                    return None, {"success": False, "error": f"الملف أكبر من الحد الأقصى المسموح ({max_mb}MB)."}
+                f.write(chunk)
+    except Exception as e:
+        return None, {"success": False, "error": f"تعذّر تحميل الملف: {e}"}
+    return local_path, None
 
 
 # ----------------------------------------------------------------------
@@ -176,9 +197,188 @@ def extract_archive(file_url: str) -> dict:
 
 
 # ----------------------------------------------------------------------
+# أداة 3: تحليل صورة (أبعاد، صيغة، بيانات EXIF)
+# ----------------------------------------------------------------------
+def _analyze_image_impl(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=30)
+        if err:
+            return err
+        try:
+            from PIL import Image, ExifTags
+            with Image.open(path) as img:
+                exif_data = {}
+                raw_exif = img.getexif()
+                if raw_exif:
+                    for tag_id, value in raw_exif.items():
+                        tag = ExifTags.TAGS.get(tag_id, str(tag_id))
+                        if isinstance(value, (str, int, float)):
+                            exif_data[tag] = value
+                return {
+                    "success": True,
+                    "format": img.format,
+                    "width": img.width,
+                    "height": img.height,
+                    "mode": img.mode,
+                    "file_size_kb": round(os.path.getsize(path) / 1024, 1),
+                    "exif": exif_data or None,
+                }
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر قراءة الصورة (صيغة غير مدعومة أو ملف تالف): {e}"}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def analyze_image_url(url: str) -> dict:
+    """
+    يجلب صورة من رابط ويرجع بياناتها الحقيقية: الأبعاد، الصيغة، حجم الملف،
+    وبيانات EXIF إن وُجدت (مثل نوع الكاميرا وتاريخ الالتقاط).
+    لا يصف محتوى الصورة بصرياً — هذا يعتمد على قدرة النموذج البصرية نفسه.
+    """
+    return _analyze_image_impl(url)
+
+
+# ----------------------------------------------------------------------
+# أداة 4: تحليل ملف صوتي (مدة، جودة، بيانات وصفية)
+# ----------------------------------------------------------------------
+def _analyze_audio_impl(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=60)
+        if err:
+            return err
+        try:
+            import mutagen
+            f = mutagen.File(path)
+            if f is None:
+                return {"success": False, "error": "الصيغة غير مدعومة أو الملف ليس ملف صوتي صالح."}
+            tags = {}
+            if f.tags:
+                for key in ("title", "artist", "album", "date", "TIT2", "TPE1", "TALB"):
+                    if key in f.tags:
+                        tags[key] = str(f.tags[key])
+            return {
+                "success": True,
+                "duration_seconds": round(f.info.length, 1) if hasattr(f.info, "length") else None,
+                "bitrate_kbps": round(f.info.bitrate / 1000, 1) if hasattr(f.info, "bitrate") else None,
+                "sample_rate": getattr(f.info, "sample_rate", None),
+                "file_size_kb": round(os.path.getsize(path) / 1024, 1),
+                "tags": tags or None,
+                "note": "هذه بيانات وصفية فقط. تفريغ الصوت لنص (Speech-to-Text) غير مفعّل حالياً لأنه يحتاج موارد أكبر من الخطة المجانية.",
+            }
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر قراءة الملف الصوتي: {e}"}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def analyze_audio_url(url: str) -> dict:
+    """
+    يجلب ملف صوتي من رابط ويرجع بياناته الحقيقية: المدة، معدل البت،
+    والبيانات الوصفية (فنان/عنوان إن وُجدت). لا يفرّغ الكلام إلى نص.
+    """
+    return _analyze_audio_impl(url)
+
+
+# ----------------------------------------------------------------------
+# أداة 5: قراءة نص من مستند (PDF / DOCX / TXT / MD / CSV / JSON)
+# ----------------------------------------------------------------------
+def _read_document_impl(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=50)
+        if err:
+            return err
+
+        ext = Path(url.split("?")[0]).suffix.lower()
+        try:
+            if ext == ".pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(path)
+                text = "\n".join((p.extract_text() or "") for p in reader.pages[:30])
+                return {
+                    "success": True,
+                    "type": "pdf",
+                    "page_count": len(reader.pages),
+                    "text": text[:12000],
+                    "truncated": len(text) > 12000,
+                }
+            elif ext == ".docx":
+                import docx
+                d = docx.Document(path)
+                text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
+                return {
+                    "success": True,
+                    "type": "docx",
+                    "paragraph_count": len(d.paragraphs),
+                    "text": text[:12000],
+                    "truncated": len(text) > 12000,
+                }
+            elif ext in (".txt", ".md", ".csv", ".json", ".py", ".js", ".html", ".xml"):
+                text = Path(path).read_text(errors="ignore")
+                return {"success": True, "type": ext.lstrip("."), "text": text[:12000], "truncated": len(text) > 12000}
+            else:
+                return {"success": False, "error": f"صيغة الملف '{ext or 'غير معروفة'}' غير مدعومة حالياً (مدعوم: pdf, docx, txt, md, csv, json)."}
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر قراءة المستند: {e}"}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def read_document_url(url: str) -> dict:
+    """
+    يحمّل مستند من رابط (PDF, DOCX, TXT, MD, CSV, JSON) ويستخرج نصه الحقيقي.
+    الرابط يجب أن ينتهي بامتداد الملف الصحيح ليعرف نوعه.
+    """
+    return _read_document_impl(url)
+
+
+# ----------------------------------------------------------------------
+# أداة 6: تحليل ملف APK (اسم الحزمة، الصلاحيات، الإصدار)
+# ----------------------------------------------------------------------
+def _analyze_apk_impl(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=100)
+        if err:
+            return err
+        try:
+            from androguard.core.apk import APK
+            apk = APK(path)
+            return {
+                "success": True,
+                "package_name": apk.get_package(),
+                "app_name": apk.get_app_name(),
+                "version_name": apk.get_androidversion_name(),
+                "version_code": apk.get_androidversion_code(),
+                "min_sdk": apk.get_min_sdk_version(),
+                "target_sdk": apk.get_target_sdk_version(),
+                "permissions": apk.get_permissions()[:50],
+                "permission_count": len(apk.get_permissions()),
+                "is_signed": apk.is_signed(),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر تحليل ملف APK (قد يكون تالفاً أو الرابط لا يشير لملف APK حقيقي): {e}"}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def analyze_apk_url(url: str) -> dict:
+    """
+    يحمّل ملف APK من رابط ويحلله فعلياً: اسم الحزمة، اسم التطبيق، الإصدار،
+    قائمة الصلاحيات الحقيقية، الحد الأدنى/الأقصى لإصدار أندرويد.
+    """
+    return _analyze_apk_impl(url)
+
+
+# ----------------------------------------------------------------------
 # نقاط REST عادية (GET) — لتُستخدم إذا كان لدى genspark ميزة عامة
 # "قراءة رابط" تفتح أي URL وتقرأ محتواه، بدل بروتوكول MCP الكامل.
-# مثال: GET /api/analyze-video?url=https://youtu.be/xxxx
 # ----------------------------------------------------------------------
 @mcp.custom_route("/api/analyze-video", methods=["GET"])
 async def api_analyze_video(request):
@@ -198,6 +398,42 @@ async def api_extract_archive(request):
     return JSONResponse(_extract_archive_impl(url))
 
 
+@mcp.custom_route("/api/analyze-image", methods=["GET"])
+async def api_analyze_image(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_analyze_image_impl(url))
+
+
+@mcp.custom_route("/api/analyze-audio", methods=["GET"])
+async def api_analyze_audio(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_analyze_audio_impl(url))
+
+
+@mcp.custom_route("/api/read-document", methods=["GET"])
+async def api_read_document(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_read_document_impl(url))
+
+
+@mcp.custom_route("/api/analyze-apk", methods=["GET"])
+async def api_analyze_apk(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_analyze_apk_impl(url))
+
+
 # ----------------------------------------------------------------------
 # نقطة فحص صحة السيرفر (يُستخدم للتأكد أنه يعمل قبل ربطه بـ genspark)
 # ----------------------------------------------------------------------
@@ -206,8 +442,15 @@ async def health(request):
     from starlette.responses import JSONResponse
     return JSONResponse({
         "status": "ok",
-        "mcp_tools": ["analyze_video_url", "extract_archive"],
-        "rest_endpoints": ["/api/analyze-video?url=...", "/api/extract-archive?url=..."],
+        "mcp_tools": [
+            "analyze_video_url", "extract_archive", "analyze_image_url",
+            "analyze_audio_url", "read_document_url", "analyze_apk_url",
+        ],
+        "rest_endpoints": [
+            "/api/analyze-video?url=...", "/api/extract-archive?url=...",
+            "/api/analyze-image?url=...", "/api/analyze-audio?url=...",
+            "/api/read-document?url=...", "/api/analyze-apk?url=...",
+        ],
     })
 
 
