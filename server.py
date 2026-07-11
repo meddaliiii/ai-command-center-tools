@@ -26,6 +26,7 @@ from pathlib import Path
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image, Audio
 
 mcp = FastMCP(
     "ai-command-center-tools",
@@ -34,9 +35,7 @@ mcp = FastMCP(
 )
 
 MAX_FILE_MB = 100
-YOUTUBE_TIKTOK_INSTAGRAM = re.compile(
-    r"(youtu\.be/|youtube\.com/(watch|shorts)|tiktok\.com/|instagram\.com/reel)"
-)
+BRIDGE_URL = "http://127.0.0.1:3001"  # جسر Node.js المحلي (Puter.js) — يعمل جنب هذا السيرفر داخل نفس الحاوية
 
 
 def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tuple[str | None, dict | None]:
@@ -64,9 +63,6 @@ def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tupl
 # أداة 1: تحليل رابط فيديو (يوتيوب / تيك توك / إنستغرام)
 # ----------------------------------------------------------------------
 def _analyze_video_url_impl(url: str) -> dict:
-    if not YOUTUBE_TIKTOK_INSTAGRAM.search(url):
-        return {"success": False, "error": "الرابط غير مدعوم حالياً (يوتيوب/تيك توك/إنستغرام فقط)."}
-
     try:
         import yt_dlp
     except ImportError:
@@ -101,11 +97,93 @@ def _analyze_video_url_impl(url: str) -> dict:
 @mcp.tool()
 def analyze_video_url(url: str) -> dict:
     """
-    يجلب بيانات حقيقية عن رابط فيديو: العنوان، الوصف، القناة، المدة،
-    والترانسكريبت إن توفر (captions أو auto-captions).
-    لا يخمّن أبداً: إذا فشل الجلب يرجع success=False مع سبب واضح.
+    يجلب بيانات حقيقية عن رابط فيديو من أي منصة تواصل مدعومة من yt-dlp
+    (يوتيوب، تيك توك، إنستغرام، تويتر/X، فيسبوك، وغيرها): العنوان، الوصف،
+    القناة، المدة، والترانسكريبت إن توفر. لا يخمّن أبداً: إذا فشل الجلب
+    يرجع success=False مع سبب واضح.
     """
     return _analyze_video_url_impl(url)
+
+
+def _extract_video_frames_impl(url: str, num_frames: int = 4):
+    if num_frames < 1 or num_frames > 8:
+        num_frames = 4
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        try:
+            import yt_dlp
+        except ImportError:
+            return [{"success": False, "error": "مكتبة yt-dlp غير مثبتة على السيرفر."}]
+
+        video_path_template = os.path.join(tmp_dir, "video.%(ext)s")
+        ydl_opts = {
+            "quiet": True,
+            "format": "worst[ext=mp4]/worst",
+            "outtmpl": video_path_template,
+            "max_filesize": 60 * 1024 * 1024,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                video_path = ydl.prepare_filename(info)
+        except Exception as e:
+            return [{"success": False, "error": f"تعذّر تحميل الفيديو: {e}"}]
+
+        if not os.path.exists(video_path):
+            return [{"success": False, "error": "لم يتم العثور على ملف الفيديو بعد التحميل (قد يكون أكبر من الحد المسموح 60MB)."}]
+
+        duration = info.get("duration") or 10
+        interval = max(duration / (num_frames + 1), 1)
+
+        frames_dir = os.path.join(tmp_dir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        try:
+            import subprocess
+            subprocess.run(
+                [
+                    "ffmpeg", "-i", video_path, "-vf", f"fps=1/{interval}",
+                    "-frames:v", str(num_frames), "-q:v", "4",
+                    os.path.join(frames_dir, "frame_%02d.jpg"), "-y",
+                ],
+                check=True, capture_output=True, timeout=60,
+            )
+        except FileNotFoundError:
+            return [{"success": False, "error": "برنامج ffmpeg غير مثبت على السيرفر (يحتاج نشر Docker)."}]
+        except Exception as e:
+            return [{"success": False, "error": f"تعذّر استخراج اللقطات: {e}"}]
+
+        frame_files = sorted(Path(frames_dir).glob("*.jpg"))
+        if not frame_files:
+            return [{"success": False, "error": "لم يتم استخراج أي لقطات من الفيديو."}]
+
+        # ناسخ البايتات قبل حذف المجلد المؤقت، لأن Image يقرأ من المسار وقت التحويل النهائي
+        images = []
+        for f in frame_files[:num_frames]:
+            with open(f, "rb") as fh:
+                images.append(Image(data=fh.read(), format="jpeg"))
+
+        summary = {
+            "success": True,
+            "title": info.get("title"),
+            "duration_seconds": duration,
+            "frame_count": len(images),
+            "note": "اللقطات أدناه استخراج فعلي من الفيديو بتباعد زمني متساوٍ — انظر إليها مباشرة لتحليل المحتوى البصري.",
+        }
+        return [summary, *images]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def extract_video_frames(url: str, num_frames: int = 4):
+    """
+    يحمّل فيديو من رابط (يوتيوب وغيرها) ويستخرج منه لقطات حقيقية بتباعد
+    زمني متساوٍ (بحد أقصى 8 لقطات)، ويرجعها كصور فعلية يمكنك رؤيتها
+    وتحليلها بصرياً مباشرة — هذا يكمّل analyze_video_url الذي يعطي النص
+    فقط. مفيد لفهم ما يحدث بصرياً في الفيديو بدون أي API خارجي.
+    الفيديوهات الأطول من ذات حجم أكبر من 60MB بجودة منخفضة قد لا تعمل.
+    """
+    return _extract_video_frames_impl(url, num_frames)
 
 
 def _extract_transcript(info: dict) -> str | None:
@@ -456,6 +534,197 @@ def analyze_apk_url(url: str) -> dict:
 
 
 # ----------------------------------------------------------------------
+# أداة 8: جلب وقراءة صفحة ويب عادية (مقالة، خبر، صفحة معلومات)
+# ----------------------------------------------------------------------
+def _fetch_webpage_impl(url: str) -> dict:
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; AICommandCenterBot/1.0)"})
+        r.raise_for_status()
+    except Exception as e:
+        return {"success": False, "error": f"تعذّر جلب الصفحة: {e}"}
+
+    title = None
+    text = None
+    try:
+        import trafilatura
+        text = trafilatura.extract(r.content, include_comments=False, include_tables=True)
+        meta = trafilatura.extract_metadata(r.content)
+        if meta:
+            title = meta.title
+    except Exception:
+        pass
+
+    if not text:
+        r.encoding = r.encoding or r.apparent_encoding
+        stripped = re.sub(r"<script.*?</script>|<style.*?</style>", " ", r.text, flags=re.DOTALL)
+        stripped = re.sub(r"<[^<]+?>", " ", stripped)
+        text = re.sub(r"\s+", " ", stripped).strip()
+
+    if not text:
+        return {"success": False, "error": "تعذّر استخراج نص مفيد من الصفحة (قد تكون تعتمد بالكامل على JavaScript)."}
+
+    return {
+        "success": True,
+        "title": title,
+        "text": text[:12000],
+        "truncated": len(text) > 12000,
+    }
+
+
+@mcp.tool()
+def fetch_webpage_url(url: str) -> dict:
+    """
+    يجلب صفحة ويب عادية (مقالة، خبر، صفحة معلومات) ويستخرج نصها الحقيقي
+    فقط، بدون قوائم تنقل أو إعلانات أو تذييل الصفحة.
+    ليس للفيديوهات — استخدم analyze_video_url لروابط الفيديو.
+    قد يفشل مع صفحات تعتمد بالكامل على JavaScript لعرض المحتوى.
+    """
+    return _fetch_webpage_impl(url)
+
+
+# ----------------------------------------------------------------------
+# أداة 9: تحويل نص إلى صوت (محلياً، بدون أي API خارجي أو مفتاح)
+# ----------------------------------------------------------------------
+def _generate_speech_bytes(text: str, lang: str = "ar"):
+    """يرجع (audio_bytes, None) عند النجاح أو (None, error_dict) عند الفشل."""
+    if not text or not text.strip():
+        return None, {"success": False, "error": "النص فارغ."}
+    if len(text) > 2000:
+        return None, {"success": False, "error": "النص أطول من 2000 حرف. قسّمه لأجزاء أصغر وأرسل كل جزء لوحده."}
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        out_path = os.path.join(tmp_dir, "speech.wav")
+        voice = "ar" if lang.lower().startswith("ar") else "en"
+        try:
+            import subprocess
+            subprocess.run(
+                ["espeak-ng", "-v", voice, "-s", "150", text, "-w", out_path],
+                check=True, capture_output=True, timeout=30,
+            )
+        except FileNotFoundError:
+            return None, {"success": False, "error": "محرك espeak-ng غير مثبت على السيرفر (يحتاج نشر Docker)."}
+        except Exception as e:
+            return None, {"success": False, "error": f"تعذّر توليد الصوت: {e}"}
+
+        if not os.path.exists(out_path):
+            return None, {"success": False, "error": "لم يتم إنشاء ملف الصوت."}
+
+        with open(out_path, "rb") as f:
+            return f.read(), None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _text_to_speech_impl(text: str, lang: str = "ar"):
+    """للاستخدام من أداة MCP: يرجع كائن Audio حقيقي يقدر النموذج يشغّله مباشرة."""
+    audio_bytes, err = _generate_speech_bytes(text, lang)
+    if err:
+        return err
+    return Audio(data=audio_bytes, format="wav")
+
+
+@mcp.tool()
+def text_to_speech(text: str, lang: str = "ar"):
+    """
+    يحوّل نصاً إلى ملف صوتي WAV حقيقي عبر محرك محلي (espeak-ng) بالكامل
+    بدون أي API خارجي أو مفتاح. الصوت اصطناعي آلي الطابع (روبوتي)،
+    وليس طبيعياً كأصوات المزوّدين المدفوعين. حد أقصى 2000 حرف لكل طلب.
+    lang: "ar" للعربية أو "en" للإنجليزية.
+    """
+    return _text_to_speech_impl(text, lang)
+
+
+# ----------------------------------------------------------------------
+# أداة 11 و12: توليد صورة/فيديو حقيقي بالذكاء الاصطناعي عبر Puter.js
+# (مجاني بدون مفتاح API من طرفنا — يحتاج جسر Node.js يعمل جنب هذا
+# السيرفر ومتغير بيئة PUTER_AUTH_TOKEN. راجع PUTER_SETUP.md)
+# ----------------------------------------------------------------------
+def _call_bridge(endpoint: str, payload: dict, timeout: int = 90):
+    try:
+        r = requests.post(f"{BRIDGE_URL}{endpoint}", json=payload, timeout=timeout)
+        return r.json(), None
+    except requests.exceptions.ConnectionError:
+        return None, {"success": False, "error": "جسر Puter (Node.js) غير متاح على السيرفر. تأكد من نشر أحدث نسخة Docker التي تحتوي bridge/."}
+    except Exception as e:
+        return None, {"success": False, "error": f"تعذّر الاتصال بجسر التوليد: {e}"}
+
+
+def _data_uri_to_bytes(data_uri: str):
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    try:
+        import base64
+        _, b64data = data_uri.split(",", 1)
+        return base64.b64decode(b64data)
+    except Exception:
+        return None
+
+
+def _generate_image_impl(prompt: str, model: str = None):
+    payload = {"prompt": prompt}
+    if model:
+        payload["model"] = model
+    result, err = _call_bridge("/generate-image", payload)
+    if err:
+        return [err]
+    if not result.get("success"):
+        return [result]
+
+    src = result.get("src", "") or ""
+    img_bytes = _data_uri_to_bytes(src)
+    if img_bytes:
+        return [{"success": True, "prompt": prompt}, Image(data=img_bytes, format="png")]
+
+    if src.startswith("http"):
+        try:
+            r = requests.get(src, timeout=30)
+            r.raise_for_status()
+            return [{"success": True, "prompt": prompt, "source_url": src}, Image(data=r.content, format="png")]
+        except Exception as e:
+            return [{"success": True, "prompt": prompt, "image_url": src, "note": f"تعذّر تحميل الصورة لعرضها مباشرة هنا، لكن الرابط أعلاه صالح: {e}"}]
+
+    return [{"success": False, "error": "لم يُرجع الجسر بيانات صورة صالحة."}]
+
+
+@mcp.tool()
+def generate_image(prompt: str, model: str = None):
+    """
+    يولّد صورة حقيقية بالذكاء الاصطناعي من وصف نصي عبر Puter.js — مجاني
+    وبدون مفتاح API مدفوع من طرفنا. يرجع الصورة الفعلية لرؤيتها مباشرة.
+    قد يفشل إذا نفدت حصة حساب Puter المجاني أو لم يُضبط الجسر بعد —
+    في هذه الحالة يرجع success=False مع السبب، ولا يخترع صورة وهمية.
+    model: اختياري (مثل "gpt-image-2" أو "black-forest-labs/flux-2-pro").
+    """
+    return _generate_image_impl(prompt, model)
+
+
+def _generate_video_impl(prompt: str) -> dict:
+    result, err = _call_bridge("/generate-video", {"prompt": prompt}, timeout=180)
+    if err:
+        return err
+    if not result.get("success"):
+        return result
+    return {
+        "success": True,
+        "prompt": prompt,
+        "video_url": result.get("src"),
+        "note": "افتح الرابط لمشاهدة الفيديو الفعلي. التوليد قد يأخذ دقيقة أو أكثر.",
+    }
+
+
+@mcp.tool()
+def generate_video(prompt: str) -> dict:
+    """
+    يولّد فيديو قصير حقيقي بالذكاء الاصطناعي من وصف نصي عبر Puter.js —
+    مجاني وبدون مفتاح API مدفوع من طرفنا. يرجع رابط الفيديو الحقيقي،
+    وليس نصاً وهمياً. قد يأخذ دقيقة أو أكثر، وقد يفشل إذا نفدت حصة
+    الحساب المجاني — في هذه الحالة يرجع success=False مع السبب الحقيقي.
+    """
+    return _generate_video_impl(prompt)
+
+
+# ----------------------------------------------------------------------
 # نقاط REST عادية (GET) — لتُستخدم إذا كان لدى genspark ميزة عامة
 # "قراءة رابط" تفتح أي URL وتقرأ محتواه، بدل بروتوكول MCP الكامل.
 # مثال: GET /api/analyze-video?url=https://youtu.be/xxxx
@@ -523,6 +792,33 @@ async def api_analyze_apk(request):
     return JSONResponse(_analyze_apk_impl(url))
 
 
+@mcp.custom_route("/api/fetch-webpage", methods=["GET"])
+async def api_fetch_webpage(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_fetch_webpage_impl(url))
+
+
+@mcp.custom_route("/api/text-to-speech", methods=["GET"])
+async def api_text_to_speech(request):
+    from starlette.responses import JSONResponse
+    import base64
+    text = request.query_params.get("text")
+    lang = request.query_params.get("lang", "ar")
+    if not text:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر text"}, status_code=400)
+    audio_bytes, err = _generate_speech_bytes(text, lang)
+    if err:
+        return JSONResponse(err)
+    return JSONResponse({
+        "success": True,
+        "format": "wav",
+        "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+    })
+
+
 # ----------------------------------------------------------------------
 # نقطة فحص صحة السيرفر (يُستخدم للتأكد أنه يعمل قبل ربطه بـ genspark)
 # ----------------------------------------------------------------------
@@ -532,14 +828,17 @@ async def health(request):
     return JSONResponse({
         "status": "ok",
         "mcp_tools": [
-            "analyze_video_url", "extract_archive", "analyze_image_url", "ocr_image_url",
-            "analyze_audio_url", "read_document_url", "analyze_apk_url",
+            "analyze_video_url", "extract_video_frames", "extract_archive",
+            "analyze_image_url", "ocr_image_url", "analyze_audio_url",
+            "read_document_url", "analyze_apk_url", "fetch_webpage_url",
+            "text_to_speech", "generate_image", "generate_video",
         ],
         "rest_endpoints": [
             "/api/analyze-video?url=...", "/api/extract-archive?url=...",
             "/api/analyze-image?url=...", "/api/ocr-image?url=...",
             "/api/analyze-audio?url=...", "/api/read-document?url=...",
-            "/api/analyze-apk?url=...",
+            "/api/analyze-apk?url=...", "/api/fetch-webpage?url=...",
+            "/api/text-to-speech?text=...&lang=ar",
         ],
     })
 
