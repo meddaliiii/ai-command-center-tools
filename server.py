@@ -143,46 +143,64 @@ def _clean_subtitle_text(raw: str) -> str:
 
 
 # ----------------------------------------------------------------------
-# أداة 2: فك ضغط أرشيف (ZIP) من رابط وإرجاع محتواه الفعلي
+# أداة 2: فك ضغط أرشيف (ZIP / RAR / 7z) من رابط وإرجاع محتواه الفعلي
 # ----------------------------------------------------------------------
 def _extract_archive_impl(file_url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
-        zip_path = os.path.join(tmp_dir, "archive.zip")
-        try:
-            r = requests.get(file_url, timeout=60, stream=True)
-            r.raise_for_status()
-            with open(zip_path, "wb") as f:
-                shutil.copyfileobj(r.raw, f)
-        except Exception as e:
-            return {"success": False, "error": f"تعذّر تحميل الملف: {e}"}
-
-        if not zipfile.is_zipfile(zip_path):
-            return {"success": False, "error": "الملف ليس أرشيف ZIP صالح (RAR/7z تحتاج مكتبة إضافية)."}
+        archive_path, err = _download_to_temp(file_url, tmp_dir, max_mb=MAX_FILE_MB)
+        if err:
+            return err
 
         extract_dir = os.path.join(tmp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
-        results = []
-        with zipfile.ZipFile(zip_path) as zf:
-            for item in zf.infolist():
-                if item.is_dir():
-                    continue
-                size_mb = item.file_size / (1024 * 1024)
-                entry = {"name": item.filename, "size_mb": round(size_mb, 2)}
-                if size_mb > MAX_FILE_MB:
-                    entry["note"] = "تم تجاوز الحد الأقصى 100MB، لم تتم معالجته."
-                    results.append(entry)
-                    continue
-                try:
-                    zf.extract(item, extract_dir)
-                    full_path = Path(extract_dir) / item.filename
-                    if full_path.suffix.lower() in (".txt", ".md", ".json", ".csv", ".py", ".js", ".html"):
-                        entry["excerpt"] = full_path.read_text(errors="ignore")[:500]
-                except Exception as e:
-                    entry["note"] = f"فشل الاستخراج: {e}"
-                results.append(entry)
+        infos = {}
+        archive_type = None
 
-        return {"success": True, "file_count": len(results), "files": results}
+        try:
+            if zipfile.is_zipfile(archive_path):
+                archive_type = "zip"
+                with zipfile.ZipFile(archive_path) as zf:
+                    infos = {i.filename: i.file_size for i in zf.infolist() if not i.is_dir()}
+                    zf.extractall(extract_dir)
+            else:
+                import rarfile
+                import py7zr
+                if rarfile.is_rarfile(archive_path):
+                    archive_type = "rar"
+                    with rarfile.RarFile(archive_path) as rf:
+                        infos = {i.filename: i.file_size for i in rf.infolist() if not i.is_dir()}
+                        rf.extractall(extract_dir)
+                elif py7zr.is_7zfile(archive_path):
+                    archive_type = "7z"
+                    with py7zr.SevenZipFile(archive_path, mode="r") as zf:
+                        zf.extractall(extract_dir)
+                    for root, _, files in os.walk(extract_dir):
+                        for fn in files:
+                            full = os.path.join(root, fn)
+                            infos[os.path.relpath(full, extract_dir)] = os.path.getsize(full)
+                else:
+                    return {"success": False, "error": "صيغة الأرشيف غير مدعومة (المدعوم حالياً: ZIP, RAR, 7z)."}
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر فتح/فك الأرشيف: {e}"}
+
+        results = []
+        for name, size in infos.items():
+            size_mb = size / (1024 * 1024)
+            entry = {"name": name, "size_mb": round(size_mb, 2)}
+            if size_mb > MAX_FILE_MB:
+                entry["note"] = "تم تجاوز الحد الأقصى 100MB، لم تتم معالجته."
+                results.append(entry)
+                continue
+            try:
+                full_path = Path(extract_dir) / name
+                if full_path.exists() and full_path.suffix.lower() in (".txt", ".md", ".json", ".csv", ".py", ".js", ".html"):
+                    entry["excerpt"] = full_path.read_text(errors="ignore")[:500]
+            except Exception as e:
+                entry["note"] = f"فشل قراءة المحتوى: {e}"
+            results.append(entry)
+
+        return {"success": True, "archive_type": archive_type, "file_count": len(results), "files": results}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -190,8 +208,8 @@ def _extract_archive_impl(file_url: str) -> dict:
 @mcp.tool()
 def extract_archive(file_url: str) -> dict:
     """
-    يحمّل أرشيف ZIP من رابط ويفك ضغطه فعلياً، ويرجع قائمة الملفات
-    الداخلية مع مقتطف نصي من كل ملف نصي (حد أقصى 100MB لكل ملف).
+    يحمّل أرشيف (ZIP أو RAR أو 7z) من رابط ويفك ضغطه فعلياً، ويرجع قائمة
+    الملفات الداخلية مع مقتطف نصي من كل ملف نصي (حد أقصى 100MB لكل ملف).
     """
     return _extract_archive_impl(file_url)
 
@@ -238,6 +256,33 @@ def analyze_image_url(url: str) -> dict:
     لا يصف محتوى الصورة بصرياً — هذا يعتمد على قدرة النموذج البصرية نفسه.
     """
     return _analyze_image_impl(url)
+
+
+def _ocr_image_impl(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=30)
+        if err:
+            return err
+        try:
+            import pytesseract
+            from PIL import Image
+            text = pytesseract.image_to_string(Image.open(path), lang="ara+eng").strip()
+            return {"success": True, "text": text[:8000], "has_text": bool(text)}
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر تشغيل OCR: {e}"}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def ocr_image_url(url: str) -> dict:
+    """
+    يستخرج فعلياً أي نص مكتوب داخل صورة (عربي أو إنجليزي) عبر Tesseract OCR.
+    مفيد للقطات شاشة أو مستندات ممسوحة ضوئياً أو صور فيها نص.
+    لا يخمّن النص — إذا ما وجد نص يرجع has_text: false.
+    """
+    return _ocr_image_impl(url)
 
 
 # ----------------------------------------------------------------------
@@ -320,8 +365,42 @@ def _read_document_impl(url: str) -> dict:
             elif ext in (".txt", ".md", ".csv", ".json", ".py", ".js", ".html", ".xml"):
                 text = Path(path).read_text(errors="ignore")
                 return {"success": True, "type": ext.lstrip("."), "text": text[:12000], "truncated": len(text) > 12000}
+            elif ext == ".xlsx":
+                import io
+                import openpyxl
+                with open(path, "rb") as fh:
+                    buf = io.BytesIO(fh.read())
+                wb = openpyxl.load_workbook(buf, data_only=True, read_only=True)
+                sheets_preview = {}
+                for sheet_name in wb.sheetnames[:5]:
+                    ws = wb[sheet_name]
+                    rows = []
+                    for i, row in enumerate(ws.iter_rows(values_only=True)):
+                        if i >= 50:
+                            break
+                        rows.append([("" if c is None else str(c)) for c in row])
+                    sheets_preview[sheet_name] = rows
+                return {
+                    "success": True,
+                    "type": "xlsx",
+                    "sheet_names": wb.sheetnames,
+                    "sheets_preview": sheets_preview,
+                    "note": "معاينة أول 50 صف من أول 5 شيتات فقط.",
+                }
+            elif ext == ".pptx":
+                import pptx
+                prs = pptx.Presentation(path)
+                slides = []
+                for i, slide in enumerate(prs.slides):
+                    texts = [
+                        shape.text_frame.text
+                        for shape in slide.shapes
+                        if shape.has_text_frame and shape.text_frame.text.strip()
+                    ]
+                    slides.append({"slide": i + 1, "text": "\n".join(texts)})
+                return {"success": True, "type": "pptx", "slide_count": len(slides), "slides": slides}
             else:
-                return {"success": False, "error": f"صيغة الملف '{ext or 'غير معروفة'}' غير مدعومة حالياً (مدعوم: pdf, docx, txt, md, csv, json)."}
+                return {"success": False, "error": f"صيغة الملف '{ext or 'غير معروفة'}' غير مدعومة حالياً (مدعوم: pdf, docx, xlsx, pptx, txt, md, csv, json)."}
         except Exception as e:
             return {"success": False, "error": f"تعذّر قراءة المستند: {e}"}
     finally:
@@ -379,6 +458,7 @@ def analyze_apk_url(url: str) -> dict:
 # ----------------------------------------------------------------------
 # نقاط REST عادية (GET) — لتُستخدم إذا كان لدى genspark ميزة عامة
 # "قراءة رابط" تفتح أي URL وتقرأ محتواه، بدل بروتوكول MCP الكامل.
+# مثال: GET /api/analyze-video?url=https://youtu.be/xxxx
 # ----------------------------------------------------------------------
 @mcp.custom_route("/api/analyze-video", methods=["GET"])
 async def api_analyze_video(request):
@@ -405,6 +485,15 @@ async def api_analyze_image(request):
     if not url:
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_analyze_image_impl(url))
+
+
+@mcp.custom_route("/api/ocr-image", methods=["GET"])
+async def api_ocr_image(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_ocr_image_impl(url))
 
 
 @mcp.custom_route("/api/analyze-audio", methods=["GET"])
@@ -443,13 +532,14 @@ async def health(request):
     return JSONResponse({
         "status": "ok",
         "mcp_tools": [
-            "analyze_video_url", "extract_archive", "analyze_image_url",
+            "analyze_video_url", "extract_archive", "analyze_image_url", "ocr_image_url",
             "analyze_audio_url", "read_document_url", "analyze_apk_url",
         ],
         "rest_endpoints": [
             "/api/analyze-video?url=...", "/api/extract-archive?url=...",
-            "/api/analyze-image?url=...", "/api/analyze-audio?url=...",
-            "/api/read-document?url=...", "/api/analyze-apk?url=...",
+            "/api/analyze-image?url=...", "/api/ocr-image?url=...",
+            "/api/analyze-audio?url=...", "/api/read-document?url=...",
+            "/api/analyze-apk?url=...",
         ],
     })
 
@@ -457,4 +547,4 @@ async def health(request):
 if __name__ == "__main__":
     # streamable-http = بروتوكول MCP عبر HTTP، هذا ما تحتاجه genspark كسيرفر MCP خارجي (remote)
     # ملاحظة: host/port يُقرآن من إعداد FastMCP نفسه أعلاه (وليس من run())
-    mcp.run(transport="streamable-http") 
+    mcp.run(transport="streamable-http")
