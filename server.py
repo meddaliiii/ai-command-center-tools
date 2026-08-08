@@ -133,10 +133,11 @@ def transcribe_video_url(url: str) -> dict:
     """
     يفرّغ الكلام المنطوق بفيديو إلى نص فعلياً عبر Whisper محلي (بدون أي
     API خارجي)، مخصص للفيديوهات التي لا تملك ترجمة جاهزة (تيك توك
-    وغيرها). أبطأ من analyze_video_url لأنه يحمّل ويعالج الصوت فعلياً.
-    غير مدعوم للفيديوهات الأطول من 10 دقائق حالياً.
-    ملاحظة: analyze_video_url يستدعي هذه الأداة تلقائياً عند غياب ترجمة
-    جاهزة، فلا داعي لاستدعائها يدوياً إلا للتفريغ القسري أو إعادة المحاولة.
+    وغيرها، حيث transcript_available=false من analyze_video_url).
+    استدعِ هذه الأداة فقط إذا كان نص الكلام المنطوق ضرورياً فعلاً للمهمة
+    — أبطأ بكثير من analyze_video_url (قد تأخذ دقيقة أو أكثر، تحمّل
+    وتعالج الصوت فعلياً)، فلا تستدعها لمجرد الفضول. غير مدعوم للفيديوهات
+    الأطول من 10 دقائق حالياً.
     """
     return _whisper_transcribe_impl(url)
 
@@ -162,15 +163,7 @@ def _analyze_video_url_impl(url: str) -> dict:
 
     transcript_text = _extract_transcript(info)
     transcript_method = "captions" if transcript_text else None
-
-    # لا توجد ترجمة جاهزة (شائع بتيك توك وغيره) — جرّب تفريغاً صوتياً محلياً
-    # فقط لو المدة معروفة ومعقولة، لتفادي معالجة طويلة بلا داعٍ
     duration = info.get("duration") or 0
-    if not transcript_text and 0 < duration <= 600:
-        whisper_result = _whisper_transcribe_impl(url)
-        if whisper_result.get("success"):
-            transcript_text = whisper_result.get("transcript")
-            transcript_method = "whisper"
 
     return {
         "success": True,
@@ -181,15 +174,25 @@ def _analyze_video_url_impl(url: str) -> dict:
         "transcript_available": bool(transcript_text),
         "transcript": transcript_text[:8000] if transcript_text else None,
         "transcript_method": transcript_method,
+        "note": None if transcript_text else (
+            "لا توجد ترجمة جاهزة لهذا الفيديو. إن كنت تحتاج فعلاً نص الكلام المنطوق، "
+            "استدعِ أداة transcribe_video_url بشكل منفصل — أبطأ بكثير (قد يأخذ دقيقة أو أكثر) "
+            "لأنها تفرّغ الصوت فعلياً، لذا لا تستدعها إلا إذا كان النص الفعلي ضرورياً للمهمة."
+        ),
     }
 
 
 @mcp.tool()
 def analyze_video_url(url: str) -> dict:
     """
-    يجلب بيانات حقيقية عن رابط فيديو من أي منصة تواصل مدعومة من yt-dlp
-    (يوتيوب، تيك توك، إنستغرام، تويتر/X، فيسبوك، وغيرها): العنوان، الوصف،
-    القناة، المدة، والترانسكريبت إن توفر. لا يخمّن أبداً: إذا فشل الجلب
+    يجلب بيانات حقيقية وسريعة عن رابط فيديو من أي منصة تواصل مدعومة من
+    yt-dlp (يوتيوب، تيك توك، إنستغرام، تويتر/X، فيسبوك، وغيرها): العنوان،
+    الوصف، القناة، المدة، وترانسكريبت جاهز إن توفر (غالباً بيوتيوب فقط).
+    سريعة دائماً (ثوانٍ معدودة) — لا تعالج صوتاً أو فيديو فعلياً.
+    إذا رجع transcript_available=false ولزم فعلاً معرفة الكلام المنطوق
+    (شائع بتيك توك)، استدعِ transcribe_video_url بعدها كخطوة منفصلة —
+    لا تفترض تلقائياً أن هذه الأداة تجلبه، وتجنب استدعاء الأداة الأبطأ
+    إلا عند الحاجة الفعلية للنص المنطوق. لا يخمّن أبداً: إذا فشل الجلب
     يرجع success=False مع سبب واضح.
     """
     return _analyze_video_url_impl(url)
