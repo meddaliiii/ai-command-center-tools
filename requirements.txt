@@ -1,4 +1,4 @@
-mcp[cli]>=1.2.0
+mcp[cli]>=1.2.0,<2.0.0
 starlette>=0.37.0
 uvicorn>=0.29.0
 yt-dlp>=2024.12.0
@@ -13,3 +13,6 @@ py7zr>=0.21.0
 pytesseract>=0.3.10
 openpyxl>=3.1.0
 python-pptx>=1.0.0
+trafilatura>=1.9.0
+claude-real-video>=0.7.0
+faster-whisper>=1.0.0

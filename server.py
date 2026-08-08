@@ -62,6 +62,85 @@ def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tupl
 # ----------------------------------------------------------------------
 # أداة 1: تحليل رابط فيديو (يوتيوب / تيك توك / إنستغرام)
 # ----------------------------------------------------------------------
+_whisper_model = None  # يُحمَّل مرة واحدة فقط عند أول استخدام فعلي (lazy)
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def _whisper_transcribe_impl(url: str) -> dict:
+    """
+    تفريغ صوتي محلي حقيقي (Whisper tiny، بدون API خارجي) — يُستخدم فقط
+    عندما لا توجد ترجمة جاهزة (مثل أغلب فيديوهات تيك توك)، لأنه أبطأ
+    وأثقل من قراءة ترجمة جاهزة من يوتيوب.
+    """
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        try:
+            import yt_dlp
+        except ImportError:
+            return {"success": False, "error": "مكتبة yt-dlp غير مثبتة على السيرفر."}
+
+        audio_template = os.path.join(tmp_dir, "audio.%(ext)s")
+        ydl_opts = {
+            "quiet": True,
+            "format": "worstaudio/worst",
+            "outtmpl": audio_template,
+            "max_filesize": 40 * 1024 * 1024,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "64",
+            }],
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر تحميل الصوت للتفريغ: {e}"}
+
+        audio_files = list(Path(tmp_dir).glob("audio.*"))
+        if not audio_files:
+            return {"success": False, "error": "لم يتم العثور على ملف صوتي بعد التحميل."}
+
+        try:
+            model = _get_whisper_model()
+            segments, info = model.transcribe(str(audio_files[0]), beam_size=1)
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+        except Exception as e:
+            return {"success": False, "error": f"تعذّر تفريغ الصوت: {e}"}
+
+        if not text:
+            return {"success": False, "error": "لم يُكتشف كلام واضح بالفيديو (قد يكون بدون صوت أو موسيقى فقط)."}
+
+        return {
+            "success": True,
+            "transcript": text[:8000],
+            "language_detected": getattr(info, "language", None),
+            "method": "whisper-tiny (محلي، بدون API خارجي)",
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def transcribe_video_url(url: str) -> dict:
+    """
+    يفرّغ الكلام المنطوق بفيديو إلى نص فعلياً عبر Whisper محلي (بدون أي
+    API خارجي)، مخصص للفيديوهات التي لا تملك ترجمة جاهزة (تيك توك
+    وغيرها). أبطأ من analyze_video_url لأنه يحمّل ويعالج الصوت فعلياً.
+    غير مدعوم للفيديوهات الأطول من 10 دقائق حالياً.
+    ملاحظة: analyze_video_url يستدعي هذه الأداة تلقائياً عند غياب ترجمة
+    جاهزة، فلا داعي لاستدعائها يدوياً إلا للتفريغ القسري أو إعادة المحاولة.
+    """
+    return _whisper_transcribe_impl(url)
+
+
 def _analyze_video_url_impl(url: str) -> dict:
     try:
         import yt_dlp
@@ -82,6 +161,16 @@ def _analyze_video_url_impl(url: str) -> dict:
         return {"success": False, "error": f"تعذّر جلب الفيديو: {e}"}
 
     transcript_text = _extract_transcript(info)
+    transcript_method = "captions" if transcript_text else None
+
+    # لا توجد ترجمة جاهزة (شائع بتيك توك وغيره) — جرّب تفريغاً صوتياً محلياً
+    # فقط لو المدة معروفة ومعقولة، لتفادي معالجة طويلة بلا داعٍ
+    duration = info.get("duration") or 0
+    if not transcript_text and 0 < duration <= 600:
+        whisper_result = _whisper_transcribe_impl(url)
+        if whisper_result.get("success"):
+            transcript_text = whisper_result.get("transcript")
+            transcript_method = "whisper"
 
     return {
         "success": True,
@@ -91,6 +180,7 @@ def _analyze_video_url_impl(url: str) -> dict:
         "description": (info.get("description") or "")[:2000],
         "transcript_available": bool(transcript_text),
         "transcript": transcript_text[:8000] if transcript_text else None,
+        "transcript_method": transcript_method,
     }
 
 
@@ -111,52 +201,24 @@ def _extract_video_frames_impl(url: str, num_frames: int = 4):
     tmp_dir = tempfile.mkdtemp()
     try:
         try:
-            import yt_dlp
+            from claude_real_video import process as crv_process
         except ImportError:
-            return [{"success": False, "error": "مكتبة yt-dlp غير مثبتة على السيرفر."}]
+            return [{"success": False, "error": "مكتبة claude-real-video غير مثبتة على السيرفر."}]
 
-        video_path_template = os.path.join(tmp_dir, "video.%(ext)s")
-        ydl_opts = {
-            "quiet": True,
-            "format": "worst[ext=mp4]/worst",
-            "outtmpl": video_path_template,
-            "max_filesize": 60 * 1024 * 1024,
-        }
+        out_dir = os.path.join(tmp_dir, "crv-out")
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                video_path = ydl.prepare_filename(info)
-        except Exception as e:
-            return [{"success": False, "error": f"تعذّر تحميل الفيديو: {e}"}]
-
-        if not os.path.exists(video_path):
-            return [{"success": False, "error": "لم يتم العثور على ملف الفيديو بعد التحميل (قد يكون أكبر من الحد المسموح 60MB)."}]
-
-        duration = info.get("duration") or 10
-        interval = max(duration / (num_frames + 1), 1)
-
-        frames_dir = os.path.join(tmp_dir, "frames")
-        os.makedirs(frames_dir, exist_ok=True)
-        try:
-            import subprocess
-            subprocess.run(
-                [
-                    "ffmpeg", "-i", video_path, "-vf", f"fps=1/{interval}",
-                    "-frames:v", str(num_frames), "-q:v", "4",
-                    os.path.join(frames_dir, "frame_%02d.jpg"), "-y",
-                ],
-                check=True, capture_output=True, timeout=60,
+            result = crv_process(
+                url, out_dir,
+                do_transcribe=False,  # النص يُجلب من analyze_video_url بشكل منفصل
+                max_frames=num_frames,
             )
-        except FileNotFoundError:
-            return [{"success": False, "error": "برنامج ffmpeg غير مثبت على السيرفر (يحتاج نشر Docker)."}]
         except Exception as e:
-            return [{"success": False, "error": f"تعذّر استخراج اللقطات: {e}"}]
+            return [{"success": False, "error": f"تعذّر تحميل/تحليل الفيديو بصرياً: {e}"}]
 
-        frame_files = sorted(Path(frames_dir).glob("*.jpg"))
+        frame_files = sorted(Path(result.frames_dir).glob("*.jpg")) if result.frames_dir and os.path.isdir(result.frames_dir) else []
         if not frame_files:
             return [{"success": False, "error": "لم يتم استخراج أي لقطات من الفيديو."}]
 
-        # ناسخ البايتات قبل حذف المجلد المؤقت، لأن Image يقرأ من المسار وقت التحويل النهائي
         images = []
         for f in frame_files[:num_frames]:
             with open(f, "rb") as fh:
@@ -164,10 +226,9 @@ def _extract_video_frames_impl(url: str, num_frames: int = 4):
 
         summary = {
             "success": True,
-            "title": info.get("title"),
-            "duration_seconds": duration,
+            "duration_seconds": result.duration,
             "frame_count": len(images),
-            "note": "اللقطات أدناه استخراج فعلي من الفيديو بتباعد زمني متساوٍ — انظر إليها مباشرة لتحليل المحتوى البصري.",
+            "note": "اللقطات أدناه استخراج ذكي (كشف تغيّر المشاهد + إزالة التكرار، وليس تباعداً زمنياً ثابتاً) — انظر إليها مباشرة لتحليل المحتوى البصري.",
         }
         return [summary, *images]
     finally:
@@ -828,10 +889,10 @@ async def health(request):
     return JSONResponse({
         "status": "ok",
         "mcp_tools": [
-            "analyze_video_url", "extract_video_frames", "extract_archive",
-            "analyze_image_url", "ocr_image_url", "analyze_audio_url",
-            "read_document_url", "analyze_apk_url", "fetch_webpage_url",
-            "text_to_speech", "generate_image", "generate_video",
+            "analyze_video_url", "transcribe_video_url", "extract_video_frames",
+            "extract_archive", "analyze_image_url", "ocr_image_url",
+            "analyze_audio_url", "read_document_url", "analyze_apk_url",
+            "fetch_webpage_url", "text_to_speech", "generate_image", "generate_video",
         ],
         "rest_endpoints": [
             "/api/analyze-video?url=...", "/api/extract-archive?url=...",
