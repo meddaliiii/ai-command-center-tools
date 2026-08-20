@@ -17,10 +17,13 @@ AI Command Center - External Tools MCP Server
     (Render يمرر متغير البيئة PORT تلقائياً، السيرفر يقرأه بنفسه)
 """
 
+import base64
 import os
 import re
 import shutil
 import tempfile
+import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -36,6 +39,11 @@ mcp = FastMCP(
 
 MAX_FILE_MB = 100
 BRIDGE_URL = "http://127.0.0.1:3001"  # جسر Node.js المحلي (Puter.js) — يعمل جنب هذا السيرفر داخل نفس الحاوية
+
+# الرابط العام للسيرفر - Render يوفره تلقائياً كمتغير بيئة، مع احتياط ثابت
+PUBLIC_BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://ai-command-center-tools-v2.onrender.com")
+DOWNLOADS_DIR = "/tmp/mcp_downloads"
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 
 def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tuple[str | None, dict | None]:
@@ -354,6 +362,92 @@ def extract_archive(file_url: str) -> dict:
     الملفات الداخلية مع مقتطف نصي من كل ملف نصي (حد أقصى 100MB لكل ملف).
     """
     return _extract_archive_impl(file_url)
+
+
+def _cleanup_old_downloads(max_age_seconds: int = 3600):
+    """ينظف ملفات التحميل الأقدم من ساعة، لأن مساحة القرص محدودة بالخطة المجانية."""
+    try:
+        now = time.time()
+        for fname in os.listdir(DOWNLOADS_DIR):
+            fpath = os.path.join(DOWNLOADS_DIR, fname)
+            if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
+                os.remove(fpath)
+    except Exception:
+        pass  # التنظيف اختياري، لا يجب أن يوقف العملية الأساسية
+
+
+def _create_archive_impl(files: list, archive_name: str = "archive") -> dict:
+    """
+    files: قائمة عناصر، كل عنصر {"name": "مسار/ملف.txt", "content": "نص..."}
+    لملف نصي، أو {"name": "مسار/صورة.png", "content_base64": "..."} لملف ثنائي.
+    """
+    if not files or not isinstance(files, list):
+        return {"success": False, "error": "مطلوب قائمة files غير فارغة."}
+
+    _cleanup_old_downloads()
+
+    safe_name = re.sub(r"[^\w\-.]", "_", archive_name).strip("_") or "archive"
+    file_id = f"{uuid.uuid4().hex[:12]}_{safe_name}.zip"
+    zip_path = os.path.join(DOWNLOADS_DIR, file_id)
+
+    total_size = 0
+    added = []
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in files:
+                name = item.get("name")
+                if not name:
+                    continue
+                # منع الهروب خارج الأرشيف بمسارات مثل ../../
+                clean_name = os.path.normpath(name).lstrip("/\\")
+                if clean_name.startswith(".."):
+                    return {"success": False, "error": f"اسم ملف غير آمن: {name}"}
+
+                if "content_base64" in item and item["content_base64"]:
+                    data = base64.b64decode(item["content_base64"])
+                elif "content" in item and item["content"] is not None:
+                    data = str(item["content"]).encode("utf-8")
+                else:
+                    return {"success": False, "error": f"الملف '{name}' بدون content أو content_base64."}
+
+                total_size += len(data)
+                if total_size > MAX_FILE_MB * 1024 * 1024:
+                    return {"success": False, "error": f"الحجم الإجمالي تجاوز الحد الأقصى {MAX_FILE_MB}MB."}
+
+                zf.writestr(clean_name, data)
+                added.append(clean_name)
+    except Exception as e:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        return {"success": False, "error": f"تعذّر إنشاء الأرشيف: {e}"}
+
+    if not added:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        return {"success": False, "error": "لم يتم إضافة أي ملف صالح للأرشيف."}
+
+    return {
+        "success": True,
+        "download_url": f"{PUBLIC_BASE_URL}/downloads/{file_id}",
+        "file_count": len(added),
+        "files": added,
+        "size_kb": round(total_size / 1024, 1),
+        "note": "الرابط صالح لمدة ساعة تقريباً فقط، نزّل الملف بأسرع وقت.",
+    }
+
+
+@mcp.tool()
+def create_archive(files: list, archive_name: str = "archive") -> dict:
+    """
+    ينشئ أرشيف ZIP حقيقي جديد من ملفات/نصوص تعطيها، ويرجع رابط تحميل
+    مباشر وفعلي للأرشيف الناتج. مفيد لتصدير مشروع أو مجموعة ملفات
+    كأرشيف واحد للمستخدم.
+    files: قائمة عناصر [{"name": "مسار/ملف.txt", "content": "نص..."}, ...]
+    للملفات النصية، أو {"name": "...", "content_base64": "..."} للملفات
+    الثنائية (صور، إلخ). المسارات تدعم مجلدات فرعية (مثل "lib/main.dart").
+    الرابط الناتج صالح لمدة ساعة تقريباً فقط، وحد الحجم الإجمالي 100MB.
+    """
+    return _create_archive_impl(files, archive_name)
 
 
 # ----------------------------------------------------------------------
@@ -789,6 +883,21 @@ def generate_video(prompt: str) -> dict:
 
 
 # ----------------------------------------------------------------------
+# نقطة تحميل الملفات المُنشأة فعلياً (لـ create_archive)
+# ----------------------------------------------------------------------
+@mcp.custom_route("/downloads/{file_id}", methods=["GET"])
+async def download_file(request):
+    from starlette.responses import FileResponse, JSONResponse
+    file_id = request.path_params.get("file_id", "")
+    # حماية بسيطة من الهروب خارج مجلد التحميلات
+    safe_id = os.path.basename(file_id)
+    file_path = os.path.join(DOWNLOADS_DIR, safe_id)
+    if not os.path.isfile(file_path):
+        return JSONResponse({"success": False, "error": "الملف غير موجود أو انتهت صلاحيته (بعد ساعة تقريباً)."}, status_code=404)
+    return FileResponse(file_path, media_type="application/zip", filename=safe_id)
+
+
+# ----------------------------------------------------------------------
 # نقاط REST عادية (GET) — لتُستخدم إذا كان لدى genspark ميزة عامة
 # "قراءة رابط" تفتح أي URL وتقرأ محتواه، بدل بروتوكول MCP الكامل.
 # مثال: GET /api/analyze-video?url=https://youtu.be/xxxx
@@ -893,7 +1002,7 @@ async def health(request):
         "status": "ok",
         "mcp_tools": [
             "analyze_video_url", "transcribe_video_url", "extract_video_frames",
-            "extract_archive", "analyze_image_url", "ocr_image_url",
+            "extract_archive", "create_archive", "analyze_image_url", "ocr_image_url",
             "analyze_audio_url", "read_document_url", "analyze_apk_url",
             "fetch_webpage_url", "text_to_speech", "generate_image", "generate_video",
         ],
