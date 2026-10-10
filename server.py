@@ -3,18 +3,9 @@ AI Command Center - External Tools MCP Server
 ------------------------------------------------
 هدف هذا السيرفر: تنفيذ العمليات التي لا يقدر نموذج اللغة ينفذها بنفسه
 (فتح روابط فيديو فعلياً، فك ضغط أرشيفات) ويرجّع بيانات حقيقية فقط.
+
 مصمم للنشر المجاني على Render.com (Web Service) ثم ربطه كأداة MCP خارجية
 داخل إعدادات تطبيق genspark (Tools / MCP Servers / Integrations).
-
-التشغيل محلياً للاختبار:
-    pip install -r requirements.txt
-    python server.py
-ثم اختبر بمتصفح: GET /health
-
-النشر على Render:
-    Build Command:  pip install -r requirements.txt
-    Start Command:  python server.py
-    (Render يمرر متغير البيئة PORT تلقائياً، السيرفر يقرأه بنفسه)
 """
 
 import base64
@@ -38,19 +29,13 @@ mcp = FastMCP(
 )
 
 MAX_FILE_MB = 100
-BRIDGE_URL = "http://127.0.0.1:3001"  # جسر Node.js المحلي (Puter.js) — يعمل جنب هذا السيرفر داخل نفس الحاوية
-
-# الرابط العام للسيرفر - Render يوفره تلقائياً كمتغير بيئة، مع احتياط ثابت
+BRIDGE_URL = "http://127.0.0.1:3001"
 PUBLIC_BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://ai-command-center-tools-v2.onrender.com")
 DOWNLOADS_DIR = "/tmp/mcp_downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 
 def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tuple[str | None, dict | None]:
-    """
-    يحمّل ملف من رابط لمجلد مؤقت. يرجع (المسار, None) عند النجاح
-    أو (None, {"success": False, "error": ...}) عند الفشل.
-    """
     local_path = os.path.join(tmp_dir, "downloaded_file")
     try:
         r = requests.get(url, timeout=60, stream=True)
@@ -67,11 +52,22 @@ def _download_to_temp(url: str, tmp_dir: str, max_mb: int = MAX_FILE_MB) -> tupl
     return local_path, None
 
 
-# ----------------------------------------------------------------------
-# أداة 1: تحليل رابط فيديو (يوتيوب / تيك توك / إنستغرام)
-# ----------------------------------------------------------------------
-_whisper_model = None  # يُحمَّل مرة واحدة فقط عند أول استخدام فعلي (lazy)
+def _cleanup_old_downloads(max_age_seconds: int = 3600):
+    try:
+        now = time.time()
+        for fname in os.listdir(DOWNLOADS_DIR):
+            fpath = os.path.join(DOWNLOADS_DIR, fname)
+            if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
+                os.remove(fpath)
+    except Exception:
+        pass
 
+
+# ──────────────────────────────────────────────────────────────────────
+# أداة 1: تحليل رابط فيديو
+# ──────────────────────────────────────────────────────────────────────
+
+_whisper_model = None
 
 def _get_whisper_model():
     global _whisper_model
@@ -82,11 +78,6 @@ def _get_whisper_model():
 
 
 def _whisper_transcribe_impl(url: str) -> dict:
-    """
-    تفريغ صوتي محلي حقيقي (Whisper tiny، بدون API خارجي) — يُستخدم فقط
-    عندما لا توجد ترجمة جاهزة (مثل أغلب فيديوهات تيك توك)، لأنه أبطأ
-    وأثقل من قراءة ترجمة جاهزة من يوتيوب.
-    """
     tmp_dir = tempfile.mkdtemp()
     try:
         try:
@@ -100,11 +91,7 @@ def _whisper_transcribe_impl(url: str) -> dict:
             "format": "worstaudio/worst",
             "outtmpl": audio_template,
             "max_filesize": 40 * 1024 * 1024,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "64",
-            }],
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "64"}],
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -124,13 +111,13 @@ def _whisper_transcribe_impl(url: str) -> dict:
             return {"success": False, "error": f"تعذّر تفريغ الصوت: {e}"}
 
         if not text:
-            return {"success": False, "error": "لم يُكتشف كلام واضح بالفيديو (قد يكون بدون صوت أو موسيقى فقط)."}
+            return {"success": False, "error": "لم يُكتشف كلام واضح بالفيديو."}
 
         return {
             "success": True,
             "transcript": text[:8000],
             "language_detected": getattr(info, "language", None),
-            "method": "whisper-tiny (محلي، بدون API خارجي)",
+            "method": "whisper-tiny (محلي)",
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -139,127 +126,13 @@ def _whisper_transcribe_impl(url: str) -> dict:
 @mcp.tool()
 def transcribe_video_url(url: str) -> dict:
     """
-    يفرّغ الكلام المنطوق بفيديو إلى نص فعلياً عبر Whisper محلي (بدون أي
-    API خارجي)، مخصص للفيديوهات التي لا تملك ترجمة جاهزة (تيك توك
-    وغيرها، حيث transcript_available=false من analyze_video_url).
-    استدعِ هذه الأداة فقط إذا كان نص الكلام المنطوق ضرورياً فعلاً للمهمة
-    — أبطأ بكثير من analyze_video_url (قد تأخذ دقيقة أو أكثر، تحمّل
-    وتعالج الصوت فعلياً)، فلا تستدعها لمجرد الفضول. غير مدعوم للفيديوهات
-    الأطول من 10 دقائق حالياً.
+    يفرّغ الكلام المنطوق بفيديو إلى نص فعلياً عبر Whisper محلي.
+    مخصص للفيديوهات التي لا تملك ترجمة جاهزة (تيك توك وغيرها).
     """
     return _whisper_transcribe_impl(url)
 
 
-def _analyze_video_url_impl(url: str) -> dict:
-    try:
-        import yt_dlp
-    except ImportError:
-        return {"success": False, "error": "مكتبة yt-dlp غير مثبتة على السيرفر."}
-
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["ar", "en"],
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        return {"success": False, "error": f"تعذّر جلب الفيديو: {e}"}
-
-    transcript_text = _extract_transcript(info)
-    transcript_method = "captions" if transcript_text else None
-    duration = info.get("duration") or 0
-
-    return {
-        "success": True,
-        "title": info.get("title"),
-        "uploader": info.get("uploader"),
-        "duration_seconds": info.get("duration"),
-        "description": (info.get("description") or "")[:2000],
-        "transcript_available": bool(transcript_text),
-        "transcript": transcript_text[:8000] if transcript_text else None,
-        "transcript_method": transcript_method,
-        "note": None if transcript_text else (
-            "لا توجد ترجمة جاهزة لهذا الفيديو. إن كنت تحتاج فعلاً نص الكلام المنطوق، "
-            "استدعِ أداة transcribe_video_url بشكل منفصل — أبطأ بكثير (قد يأخذ دقيقة أو أكثر) "
-            "لأنها تفرّغ الصوت فعلياً، لذا لا تستدعها إلا إذا كان النص الفعلي ضرورياً للمهمة."
-        ),
-    }
-
-
-@mcp.tool()
-def analyze_video_url(url: str) -> dict:
-    """
-    يجلب بيانات حقيقية وسريعة عن رابط فيديو من أي منصة تواصل مدعومة من
-    yt-dlp (يوتيوب، تيك توك، إنستغرام، تويتر/X، فيسبوك، وغيرها): العنوان،
-    الوصف، القناة، المدة، وترانسكريبت جاهز إن توفر (غالباً بيوتيوب فقط).
-    سريعة دائماً (ثوانٍ معدودة) — لا تعالج صوتاً أو فيديو فعلياً.
-    إذا رجع transcript_available=false ولزم فعلاً معرفة الكلام المنطوق
-    (شائع بتيك توك)، استدعِ transcribe_video_url بعدها كخطوة منفصلة —
-    لا تفترض تلقائياً أن هذه الأداة تجلبه، وتجنب استدعاء الأداة الأبطأ
-    إلا عند الحاجة الفعلية للنص المنطوق. لا يخمّن أبداً: إذا فشل الجلب
-    يرجع success=False مع سبب واضح.
-    """
-    return _analyze_video_url_impl(url)
-
-
-def _extract_video_frames_impl(url: str, num_frames: int = 4):
-    if num_frames < 1 or num_frames > 8:
-        num_frames = 4
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        try:
-            from claude_real_video import process as crv_process
-        except ImportError:
-            return [{"success": False, "error": "مكتبة claude-real-video غير مثبتة على السيرفر."}]
-
-        out_dir = os.path.join(tmp_dir, "crv-out")
-        try:
-            result = crv_process(
-                url, out_dir,
-                do_transcribe=False,  # النص يُجلب من analyze_video_url بشكل منفصل
-                max_frames=num_frames,
-            )
-        except Exception as e:
-            return [{"success": False, "error": f"تعذّر تحميل/تحليل الفيديو بصرياً: {e}"}]
-
-        frame_files = sorted(Path(result.frames_dir).glob("*.jpg")) if result.frames_dir and os.path.isdir(result.frames_dir) else []
-        if not frame_files:
-            return [{"success": False, "error": "لم يتم استخراج أي لقطات من الفيديو."}]
-
-        images = []
-        for f in frame_files[:num_frames]:
-            with open(f, "rb") as fh:
-                images.append(Image(data=fh.read(), format="jpeg"))
-
-        summary = {
-            "success": True,
-            "duration_seconds": result.duration,
-            "frame_count": len(images),
-            "note": "اللقطات أدناه استخراج ذكي (كشف تغيّر المشاهد + إزالة التكرار، وليس تباعداً زمنياً ثابتاً) — انظر إليها مباشرة لتحليل المحتوى البصري.",
-        }
-        return [summary, *images]
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-@mcp.tool()
-def extract_video_frames(url: str, num_frames: int = 4):
-    """
-    يحمّل فيديو من رابط (يوتيوب وغيرها) ويستخرج منه لقطات حقيقية بتباعد
-    زمني متساوٍ (بحد أقصى 8 لقطات)، ويرجعها كصور فعلية يمكنك رؤيتها
-    وتحليلها بصرياً مباشرة — هذا يكمّل analyze_video_url الذي يعطي النص
-    فقط. مفيد لفهم ما يحدث بصرياً في الفيديو بدون أي API خارجي.
-    الفيديوهات الأطول من ذات حجم أكبر من 60MB بجودة منخفضة قد لا تعمل.
-    """
-    return _extract_video_frames_impl(url, num_frames)
-
-
 def _extract_transcript(info: dict) -> str | None:
-    """يحاول استخراج نص الترجمة من subtitles أو automatic_captions إن وُجدت."""
     for key in ("subtitles", "automatic_captions"):
         tracks = info.get(key) or {}
         for lang in ("ar", "en"):
@@ -292,9 +165,97 @@ def _clean_subtitle_text(raw: str) -> str:
     return " ".join(out)
 
 
-# ----------------------------------------------------------------------
-# أداة 2: فك ضغط أرشيف (ZIP / RAR / 7z) من رابط وإرجاع محتواه الفعلي
-# ----------------------------------------------------------------------
+def _analyze_video_url_impl(url: str) -> dict:
+    try:
+        import yt_dlp
+    except ImportError:
+        return {"success": False, "error": "مكتبة yt-dlp غير مثبتة على السيرفر."}
+
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["ar", "en"],
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return {"success": False, "error": f"تعذّر جلب الفيديو: {e}"}
+
+    transcript_text = _extract_transcript(info)
+    return {
+        "success": True,
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration_seconds": info.get("duration"),
+        "description": (info.get("description") or "")[:2000],
+        "transcript_available": bool(transcript_text),
+        "transcript": transcript_text[:8000] if transcript_text else None,
+        "transcript_method": "captions" if transcript_text else None,
+        "note": None if transcript_text else (
+            "لا توجد ترجمة جاهزة. استدعِ transcribe_video_url إن لزم نص الكلام."
+        ),
+    }
+
+
+@mcp.tool()
+def analyze_video_url(url: str) -> dict:
+    """
+    يجلب بيانات حقيقية عن رابط فيديو: العنوان، الوصف، القناة، المدة،
+    وترانسكريبت جاهز إن توفر. يدعم يوتيوب وتيك توك وإنستغرام وغيرها.
+    """
+    return _analyze_video_url_impl(url)
+
+
+def _extract_video_frames_impl(url: str, num_frames: int = 4):
+    if num_frames < 1 or num_frames > 8:
+        num_frames = 4
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        try:
+            from claude_real_video import process as crv_process
+        except ImportError:
+            return [{"success": False, "error": "مكتبة claude-real-video غير مثبتة على السيرفر."}]
+
+        out_dir = os.path.join(tmp_dir, "crv-out")
+        try:
+            result = crv_process(url, out_dir, do_transcribe=False, max_frames=num_frames)
+        except Exception as e:
+            return [{"success": False, "error": f"تعذّر تحليل الفيديو بصرياً: {e}"}]
+
+        frame_files = sorted(Path(result.frames_dir).glob("*.jpg")) if result.frames_dir and os.path.isdir(result.frames_dir) else []
+        if not frame_files:
+            return [{"success": False, "error": "لم يتم استخراج أي لقطات."}]
+
+        images = []
+        for f in frame_files[:num_frames]:
+            with open(f, "rb") as fh:
+                images.append(Image(data=fh.read(), format="jpeg"))
+
+        summary = {
+            "success": True,
+            "duration_seconds": result.duration,
+            "frame_count": len(images),
+        }
+        return [summary, *images]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def extract_video_frames(url: str, num_frames: int = 4):
+    """
+    يحمّل فيديو من رابط ويستخرج منه لقطات حقيقية (بحد أقصى 8 لقطات).
+    """
+    return _extract_video_frames_impl(url, num_frames)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# أداة 2: فك ضغط أرشيف
+# ──────────────────────────────────────────────────────────────────────
+
 def _extract_archive_impl(file_url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
@@ -330,7 +291,7 @@ def _extract_archive_impl(file_url: str) -> dict:
                             full = os.path.join(root, fn)
                             infos[os.path.relpath(full, extract_dir)] = os.path.getsize(full)
                 else:
-                    return {"success": False, "error": "صيغة الأرشيف غير مدعومة (المدعوم حالياً: ZIP, RAR, 7z)."}
+                    return {"success": False, "error": "صيغة الأرشيف غير مدعومة (ZIP, RAR, 7z فقط)."}
         except Exception as e:
             return {"success": False, "error": f"تعذّر فتح/فك الأرشيف: {e}"}
 
@@ -339,7 +300,7 @@ def _extract_archive_impl(file_url: str) -> dict:
             size_mb = size / (1024 * 1024)
             entry = {"name": name, "size_mb": round(size_mb, 2)}
             if size_mb > MAX_FILE_MB:
-                entry["note"] = "تم تجاوز الحد الأقصى 100MB، لم تتم معالجته."
+                entry["note"] = "تجاوز الحد الأقصى 100MB."
                 results.append(entry)
                 continue
             try:
@@ -358,62 +319,40 @@ def _extract_archive_impl(file_url: str) -> dict:
 @mcp.tool()
 def extract_archive(file_url: str) -> dict:
     """
-    يحمّل أرشيف (ZIP أو RAR أو 7z) من رابط ويفك ضغطه فعلياً، ويرجع قائمة
-    الملفات الداخلية مع مقتطف نصي من كل ملف نصي (حد أقصى 100MB لكل ملف).
+    يحمّل أرشيف (ZIP أو RAR أو 7z) من رابط ويفك ضغطه فعلياً.
     """
     return _extract_archive_impl(file_url)
 
 
-def _cleanup_old_downloads(max_age_seconds: int = 3600):
-    """ينظف ملفات التحميل الأقدم من ساعة، لأن مساحة القرص محدودة بالخطة المجانية."""
-    try:
-        now = time.time()
-        for fname in os.listdir(DOWNLOADS_DIR):
-            fpath = os.path.join(DOWNLOADS_DIR, fname)
-            if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
-                os.remove(fpath)
-    except Exception:
-        pass  # التنظيف اختياري، لا يجب أن يوقف العملية الأساسية
-
-
 def _create_archive_impl(files: list, archive_name: str = "archive") -> dict:
-    """
-    files: قائمة عناصر، كل عنصر {"name": "مسار/ملف.txt", "content": "نص..."}
-    لملف نصي، أو {"name": "مسار/صورة.png", "content_base64": "..."} لملف ثنائي.
-    """
     if not files or not isinstance(files, list):
         return {"success": False, "error": "مطلوب قائمة files غير فارغة."}
 
     _cleanup_old_downloads()
-
     safe_name = re.sub(r"[^\w\-.]", "_", archive_name).strip("_") or "archive"
     file_id = f"{uuid.uuid4().hex[:12]}_{safe_name}.zip"
     zip_path = os.path.join(DOWNLOADS_DIR, file_id)
-
     total_size = 0
     added = []
+
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for item in files:
                 name = item.get("name")
                 if not name:
                     continue
-                # منع الهروب خارج الأرشيف بمسارات مثل ../../
                 clean_name = os.path.normpath(name).lstrip("/\\")
                 if clean_name.startswith(".."):
                     return {"success": False, "error": f"اسم ملف غير آمن: {name}"}
-
                 if "content_base64" in item and item["content_base64"]:
                     data = base64.b64decode(item["content_base64"])
                 elif "content" in item and item["content"] is not None:
                     data = str(item["content"]).encode("utf-8")
                 else:
-                    return {"success": False, "error": f"الملف '{name}' بدون content أو content_base64."}
-
+                    return {"success": False, "error": f"الملف '{name}' بدون content."}
                 total_size += len(data)
                 if total_size > MAX_FILE_MB * 1024 * 1024:
-                    return {"success": False, "error": f"الحجم الإجمالي تجاوز الحد الأقصى {MAX_FILE_MB}MB."}
-
+                    return {"success": False, "error": f"الحجم تجاوز {MAX_FILE_MB}MB."}
                 zf.writestr(clean_name, data)
                 added.append(clean_name)
     except Exception as e:
@@ -424,7 +363,7 @@ def _create_archive_impl(files: list, archive_name: str = "archive") -> dict:
     if not added:
         if os.path.exists(zip_path):
             os.remove(zip_path)
-        return {"success": False, "error": "لم يتم إضافة أي ملف صالح للأرشيف."}
+        return {"success": False, "error": "لم يتم إضافة أي ملف."}
 
     return {
         "success": True,
@@ -432,27 +371,22 @@ def _create_archive_impl(files: list, archive_name: str = "archive") -> dict:
         "file_count": len(added),
         "files": added,
         "size_kb": round(total_size / 1024, 1),
-        "note": "الرابط صالح لمدة ساعة تقريباً فقط، نزّل الملف بأسرع وقت.",
+        "note": "الرابط صالح لمدة ساعة تقريباً.",
     }
 
 
 @mcp.tool()
 def create_archive(files: list, archive_name: str = "archive") -> dict:
     """
-    ينشئ أرشيف ZIP حقيقي جديد من ملفات/نصوص تعطيها، ويرجع رابط تحميل
-    مباشر وفعلي للأرشيف الناتج. مفيد لتصدير مشروع أو مجموعة ملفات
-    كأرشيف واحد للمستخدم.
-    files: قائمة عناصر [{"name": "مسار/ملف.txt", "content": "نص..."}, ...]
-    للملفات النصية، أو {"name": "...", "content_base64": "..."} للملفات
-    الثنائية (صور، إلخ). المسارات تدعم مجلدات فرعية (مثل "lib/main.dart").
-    الرابط الناتج صالح لمدة ساعة تقريباً فقط، وحد الحجم الإجمالي 100MB.
+    ينشئ أرشيف ZIP من ملفات/نصوص ويرجع رابط تحميل مباشر.
     """
     return _create_archive_impl(files, archive_name)
 
 
-# ----------------------------------------------------------------------
-# أداة 3: تحليل صورة (أبعاد، صيغة، بيانات EXIF)
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# أداة 3: تحليل صورة
+# ──────────────────────────────────────────────────────────────────────
+
 def _analyze_image_impl(url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
@@ -479,7 +413,7 @@ def _analyze_image_impl(url: str) -> dict:
                     "exif": exif_data or None,
                 }
         except Exception as e:
-            return {"success": False, "error": f"تعذّر قراءة الصورة (صيغة غير مدعومة أو ملف تالف): {e}"}
+            return {"success": False, "error": f"تعذّر قراءة الصورة: {e}"}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -487,9 +421,7 @@ def _analyze_image_impl(url: str) -> dict:
 @mcp.tool()
 def analyze_image_url(url: str) -> dict:
     """
-    يجلب صورة من رابط ويرجع بياناتها الحقيقية: الأبعاد، الصيغة، حجم الملف،
-    وبيانات EXIF إن وُجدت (مثل نوع الكاميرا وتاريخ الالتقاط).
-    لا يصف محتوى الصورة بصرياً — هذا يعتمد على قدرة النموذج البصرية نفسه.
+    يجلب صورة من رابط ويرجع بياناتها: الأبعاد، الصيغة، حجم الملف، وبيانات EXIF.
     """
     return _analyze_image_impl(url)
 
@@ -514,16 +446,15 @@ def _ocr_image_impl(url: str) -> dict:
 @mcp.tool()
 def ocr_image_url(url: str) -> dict:
     """
-    يستخرج فعلياً أي نص مكتوب داخل صورة (عربي أو إنجليزي) عبر Tesseract OCR.
-    مفيد للقطات شاشة أو مستندات ممسوحة ضوئياً أو صور فيها نص.
-    لا يخمّن النص — إذا ما وجد نص يرجع has_text: false.
+    يستخرج أي نص مكتوب داخل صورة (عربي أو إنجليزي) عبر Tesseract OCR.
     """
     return _ocr_image_impl(url)
 
 
-# ----------------------------------------------------------------------
-# أداة 4: تحليل ملف صوتي (مدة، جودة، بيانات وصفية)
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# أداة 4: تحليل صوت
+# ──────────────────────────────────────────────────────────────────────
+
 def _analyze_audio_impl(url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
@@ -534,7 +465,7 @@ def _analyze_audio_impl(url: str) -> dict:
             import mutagen
             f = mutagen.File(path)
             if f is None:
-                return {"success": False, "error": "الصيغة غير مدعومة أو الملف ليس ملف صوتي صالح."}
+                return {"success": False, "error": "الصيغة غير مدعومة أو الملف ليس صوتي."}
             tags = {}
             if f.tags:
                 for key in ("title", "artist", "album", "date", "TIT2", "TPE1", "TALB"):
@@ -547,7 +478,6 @@ def _analyze_audio_impl(url: str) -> dict:
                 "sample_rate": getattr(f.info, "sample_rate", None),
                 "file_size_kb": round(os.path.getsize(path) / 1024, 1),
                 "tags": tags or None,
-                "note": "هذه بيانات وصفية فقط. تفريغ الصوت لنص (Speech-to-Text) غير مفعّل حالياً لأنه يحتاج موارد أكبر من الخطة المجانية.",
             }
         except Exception as e:
             return {"success": False, "error": f"تعذّر قراءة الملف الصوتي: {e}"}
@@ -558,46 +488,33 @@ def _analyze_audio_impl(url: str) -> dict:
 @mcp.tool()
 def analyze_audio_url(url: str) -> dict:
     """
-    يجلب ملف صوتي من رابط ويرجع بياناته الحقيقية: المدة، معدل البت،
-    والبيانات الوصفية (فنان/عنوان إن وُجدت). لا يفرّغ الكلام إلى نص.
+    يجلب ملف صوتي من رابط ويرجع بياناته: المدة، معدل البت، والبيانات الوصفية.
     """
     return _analyze_audio_impl(url)
 
 
-# ----------------------------------------------------------------------
-# أداة 5: قراءة نص من مستند (PDF / DOCX / TXT / MD / CSV / JSON)
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# أداة 5: قراءة مستندات
+# ──────────────────────────────────────────────────────────────────────
+
 def _read_document_impl(url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
         path, err = _download_to_temp(url, tmp_dir, max_mb=50)
         if err:
             return err
-
         ext = Path(url.split("?")[0]).suffix.lower()
         try:
             if ext == ".pdf":
                 from pypdf import PdfReader
                 reader = PdfReader(path)
                 text = "\n".join((p.extract_text() or "") for p in reader.pages[:30])
-                return {
-                    "success": True,
-                    "type": "pdf",
-                    "page_count": len(reader.pages),
-                    "text": text[:12000],
-                    "truncated": len(text) > 12000,
-                }
+                return {"success": True, "type": "pdf", "page_count": len(reader.pages), "text": text[:12000], "truncated": len(text) > 12000}
             elif ext == ".docx":
                 import docx
                 d = docx.Document(path)
                 text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
-                return {
-                    "success": True,
-                    "type": "docx",
-                    "paragraph_count": len(d.paragraphs),
-                    "text": text[:12000],
-                    "truncated": len(text) > 12000,
-                }
+                return {"success": True, "type": "docx", "paragraph_count": len(d.paragraphs), "text": text[:12000], "truncated": len(text) > 12000}
             elif ext in (".txt", ".md", ".csv", ".json", ".py", ".js", ".html", ".xml"):
                 text = Path(path).read_text(errors="ignore")
                 return {"success": True, "type": ext.lstrip("."), "text": text[:12000], "truncated": len(text) > 12000}
@@ -616,27 +533,17 @@ def _read_document_impl(url: str) -> dict:
                             break
                         rows.append([("" if c is None else str(c)) for c in row])
                     sheets_preview[sheet_name] = rows
-                return {
-                    "success": True,
-                    "type": "xlsx",
-                    "sheet_names": wb.sheetnames,
-                    "sheets_preview": sheets_preview,
-                    "note": "معاينة أول 50 صف من أول 5 شيتات فقط.",
-                }
+                return {"success": True, "type": "xlsx", "sheet_names": wb.sheetnames, "sheets_preview": sheets_preview}
             elif ext == ".pptx":
                 import pptx
                 prs = pptx.Presentation(path)
                 slides = []
                 for i, slide in enumerate(prs.slides):
-                    texts = [
-                        shape.text_frame.text
-                        for shape in slide.shapes
-                        if shape.has_text_frame and shape.text_frame.text.strip()
-                    ]
+                    texts = [shape.text_frame.text for shape in slide.shapes if shape.has_text_frame and shape.text_frame.text.strip()]
                     slides.append({"slide": i + 1, "text": "\n".join(texts)})
                 return {"success": True, "type": "pptx", "slide_count": len(slides), "slides": slides}
             else:
-                return {"success": False, "error": f"صيغة الملف '{ext or 'غير معروفة'}' غير مدعومة حالياً (مدعوم: pdf, docx, xlsx, pptx, txt, md, csv, json)."}
+                return {"success": False, "error": f"صيغة '{ext}' غير مدعومة (pdf, docx, xlsx, pptx, txt, md, csv, json)."}
         except Exception as e:
             return {"success": False, "error": f"تعذّر قراءة المستند: {e}"}
     finally:
@@ -646,15 +553,15 @@ def _read_document_impl(url: str) -> dict:
 @mcp.tool()
 def read_document_url(url: str) -> dict:
     """
-    يحمّل مستند من رابط (PDF, DOCX, TXT, MD, CSV, JSON) ويستخرج نصه الحقيقي.
-    الرابط يجب أن ينتهي بامتداد الملف الصحيح ليعرف نوعه.
+    يحمّل مستند من رابط (PDF, DOCX, TXT, MD, CSV, JSON, XLSX, PPTX) ويستخرج نصه.
     """
     return _read_document_impl(url)
 
 
-# ----------------------------------------------------------------------
-# أداة 6: تحليل ملف APK (اسم الحزمة، الصلاحيات، الإصدار)
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# أداة 6: تحليل APK
+# ──────────────────────────────────────────────────────────────────────
+
 def _analyze_apk_impl(url: str) -> dict:
     tmp_dir = tempfile.mkdtemp()
     try:
@@ -677,7 +584,7 @@ def _analyze_apk_impl(url: str) -> dict:
                 "is_signed": apk.is_signed(),
             }
         except Exception as e:
-            return {"success": False, "error": f"تعذّر تحليل ملف APK (قد يكون تالفاً أو الرابط لا يشير لملف APK حقيقي): {e}"}
+            return {"success": False, "error": f"تعذّر تحليل APK: {e}"}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -685,15 +592,15 @@ def _analyze_apk_impl(url: str) -> dict:
 @mcp.tool()
 def analyze_apk_url(url: str) -> dict:
     """
-    يحمّل ملف APK من رابط ويحلله فعلياً: اسم الحزمة، اسم التطبيق، الإصدار،
-    قائمة الصلاحيات الحقيقية، الحد الأدنى/الأقصى لإصدار أندرويد.
+    يحمّل ملف APK ويحلله: اسم الحزمة، الإصدار، قائمة الصلاحيات.
     """
     return _analyze_apk_impl(url)
 
 
-# ----------------------------------------------------------------------
-# أداة 8: جلب وقراءة صفحة ويب عادية (مقالة، خبر، صفحة معلومات)
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# أداة 7: جلب صفحة ويب
+# ──────────────────────────────────────────────────────────────────────
+
 def _fetch_webpage_impl(url: str) -> dict:
     try:
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; AICommandCenterBot/1.0)"})
@@ -719,36 +626,28 @@ def _fetch_webpage_impl(url: str) -> dict:
         text = re.sub(r"\s+", " ", stripped).strip()
 
     if not text:
-        return {"success": False, "error": "تعذّر استخراج نص مفيد من الصفحة (قد تكون تعتمد بالكامل على JavaScript)."}
+        return {"success": False, "error": "تعذّر استخراج نص مفيد (قد تعتمد على JavaScript)."}
 
-    return {
-        "success": True,
-        "title": title,
-        "text": text[:12000],
-        "truncated": len(text) > 12000,
-    }
+    return {"success": True, "title": title, "text": text[:12000], "truncated": len(text) > 12000}
 
 
 @mcp.tool()
 def fetch_webpage_url(url: str) -> dict:
     """
-    يجلب صفحة ويب عادية (مقالة، خبر، صفحة معلومات) ويستخرج نصها الحقيقي
-    فقط، بدون قوائم تنقل أو إعلانات أو تذييل الصفحة.
-    ليس للفيديوهات — استخدم analyze_video_url لروابط الفيديو.
-    قد يفشل مع صفحات تعتمد بالكامل على JavaScript لعرض المحتوى.
+    يجلب صفحة ويب ويستخرج نصها الحقيقي بدون إعلانات أو قوائم تنقل.
     """
     return _fetch_webpage_impl(url)
 
 
-# ----------------------------------------------------------------------
-# أداة 9: تحويل نص إلى صوت (محلياً، بدون أي API خارجي أو مفتاح)
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# أداة 8: تحويل نص إلى صوت
+# ──────────────────────────────────────────────────────────────────────
+
 def _generate_speech_bytes(text: str, lang: str = "ar"):
-    """يرجع (audio_bytes, None) عند النجاح أو (None, error_dict) عند الفشل."""
     if not text or not text.strip():
         return None, {"success": False, "error": "النص فارغ."}
     if len(text) > 2000:
-        return None, {"success": False, "error": "النص أطول من 2000 حرف. قسّمه لأجزاء أصغر وأرسل كل جزء لوحده."}
+        return None, {"success": False, "error": "النص أطول من 2000 حرف."}
 
     tmp_dir = tempfile.mkdtemp()
     try:
@@ -756,12 +655,10 @@ def _generate_speech_bytes(text: str, lang: str = "ar"):
         voice = "ar" if lang.lower().startswith("ar") else "en"
         try:
             import subprocess
-            subprocess.run(
-                ["espeak-ng", "-v", voice, "-s", "150", text, "-w", out_path],
-                check=True, capture_output=True, timeout=30,
-            )
+            subprocess.run(["espeak-ng", "-v", voice, "-s", "150", text, "-w", out_path],
+                           check=True, capture_output=True, timeout=30)
         except FileNotFoundError:
-            return None, {"success": False, "error": "محرك espeak-ng غير مثبت على السيرفر (يحتاج نشر Docker)."}
+            return None, {"success": False, "error": "محرك espeak-ng غير مثبت."}
         except Exception as e:
             return None, {"success": False, "error": f"تعذّر توليد الصوت: {e}"}
 
@@ -774,36 +671,28 @@ def _generate_speech_bytes(text: str, lang: str = "ar"):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _text_to_speech_impl(text: str, lang: str = "ar"):
-    """للاستخدام من أداة MCP: يرجع كائن Audio حقيقي يقدر النموذج يشغّله مباشرة."""
+@mcp.tool()
+def text_to_speech(text: str, lang: str = "ar"):
+    """
+    يحوّل نصاً إلى ملف صوتي WAV عبر espeak-ng (محلي، بدون API خارجي).
+    lang: "ar" للعربية أو "en" للإنجليزية. حد أقصى 2000 حرف.
+    """
     audio_bytes, err = _generate_speech_bytes(text, lang)
     if err:
         return err
     return Audio(data=audio_bytes, format="wav")
 
 
-@mcp.tool()
-def text_to_speech(text: str, lang: str = "ar"):
-    """
-    يحوّل نصاً إلى ملف صوتي WAV حقيقي عبر محرك محلي (espeak-ng) بالكامل
-    بدون أي API خارجي أو مفتاح. الصوت اصطناعي آلي الطابع (روبوتي)،
-    وليس طبيعياً كأصوات المزوّدين المدفوعين. حد أقصى 2000 حرف لكل طلب.
-    lang: "ar" للعربية أو "en" للإنجليزية.
-    """
-    return _text_to_speech_impl(text, lang)
+# ──────────────────────────────────────────────────────────────────────
+# أداة 9 و10: توليد صورة/فيديو عبر Puter.js
+# ──────────────────────────────────────────────────────────────────────
 
-
-# ----------------------------------------------------------------------
-# أداة 11 و12: توليد صورة/فيديو حقيقي بالذكاء الاصطناعي عبر Puter.js
-# (مجاني بدون مفتاح API من طرفنا — يحتاج جسر Node.js يعمل جنب هذا
-# السيرفر ومتغير بيئة PUTER_AUTH_TOKEN. راجع PUTER_SETUP.md)
-# ----------------------------------------------------------------------
 def _call_bridge(endpoint: str, payload: dict, timeout: int = 90):
     try:
         r = requests.post(f"{BRIDGE_URL}{endpoint}", json=payload, timeout=timeout)
         return r.json(), None
     except requests.exceptions.ConnectionError:
-        return None, {"success": False, "error": "جسر Puter (Node.js) غير متاح على السيرفر. تأكد من نشر أحدث نسخة Docker التي تحتوي bridge/."}
+        return None, {"success": False, "error": "جسر Puter (Node.js) غير متاح على السيرفر."}
     except Exception as e:
         return None, {"success": False, "error": f"تعذّر الاتصال بجسر التوليد: {e}"}
 
@@ -812,7 +701,6 @@ def _data_uri_to_bytes(data_uri: str):
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         return None
     try:
-        import base64
         _, b64data = data_uri.split(",", 1)
         return base64.b64decode(b64data)
     except Exception:
@@ -828,31 +716,25 @@ def _generate_image_impl(prompt: str, model: str = None):
         return [err]
     if not result.get("success"):
         return [result]
-
     src = result.get("src", "") or ""
     img_bytes = _data_uri_to_bytes(src)
     if img_bytes:
         return [{"success": True, "prompt": prompt}, Image(data=img_bytes, format="png")]
-
     if src.startswith("http"):
         try:
             r = requests.get(src, timeout=30)
             r.raise_for_status()
-            return [{"success": True, "prompt": prompt, "source_url": src}, Image(data=r.content, format="png")]
+            return [{"success": True, "prompt": prompt}, Image(data=r.content, format="png")]
         except Exception as e:
-            return [{"success": True, "prompt": prompt, "image_url": src, "note": f"تعذّر تحميل الصورة لعرضها مباشرة هنا، لكن الرابط أعلاه صالح: {e}"}]
-
+            return [{"success": True, "prompt": prompt, "image_url": src}]
     return [{"success": False, "error": "لم يُرجع الجسر بيانات صورة صالحة."}]
 
 
 @mcp.tool()
 def generate_image(prompt: str, model: str = None):
     """
-    يولّد صورة حقيقية بالذكاء الاصطناعي من وصف نصي عبر Puter.js — مجاني
-    وبدون مفتاح API مدفوع من طرفنا. يرجع الصورة الفعلية لرؤيتها مباشرة.
-    قد يفشل إذا نفدت حصة حساب Puter المجاني أو لم يُضبط الجسر بعد —
-    في هذه الحالة يرجع success=False مع السبب، ولا يخترع صورة وهمية.
-    model: اختياري (مثل "gpt-image-2" أو "black-forest-labs/flux-2-pro").
+    يولّد صورة حقيقية بالذكاء الاصطناعي من وصف نصي عبر Puter.js.
+    model: اختياري مثل "gpt-image-2" أو "black-forest-labs/flux-2-pro".
     """
     return _generate_image_impl(prompt, model)
 
@@ -867,41 +749,342 @@ def _generate_video_impl(prompt: str) -> dict:
         "success": True,
         "prompt": prompt,
         "video_url": result.get("src"),
-        "note": "افتح الرابط لمشاهدة الفيديو الفعلي. التوليد قد يأخذ دقيقة أو أكثر.",
+        "note": "افتح الرابط لمشاهدة الفيديو. التوليد قد يأخذ دقيقة أو أكثر.",
     }
 
 
 @mcp.tool()
 def generate_video(prompt: str) -> dict:
     """
-    يولّد فيديو قصير حقيقي بالذكاء الاصطناعي من وصف نصي عبر Puter.js —
-    مجاني وبدون مفتاح API مدفوع من طرفنا. يرجع رابط الفيديو الحقيقي،
-    وليس نصاً وهمياً. قد يأخذ دقيقة أو أكثر، وقد يفشل إذا نفدت حصة
-    الحساب المجاني — في هذه الحالة يرجع success=False مع السبب الحقيقي.
+    يولّد فيديو قصير حقيقي بالذكاء الاصطناعي من وصف نصي عبر Puter.js.
     """
     return _generate_video_impl(prompt)
 
 
-# ----------------------------------------------------------------------
-# نقطة تحميل الملفات المُنشأة فعلياً (لـ create_archive)
-# ----------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════
+# ████  أدوات .so — تحليل وتعديل وإعادة تجميع  ████
+# ══════════════════════════════════════════════════════════════════════
+
+def _run_cmd(cmd: list, timeout: int = 30) -> str:
+    """تشغيل أمر نظام وإرجاع المخرجات."""
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception as e:
+        return f"خطأ: {e}"
+
+
+def _analyze_so_impl(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=50)
+        if err:
+            return err
+
+        # معلومات أساسية بأدوات النظام
+        file_info   = _run_cmd(["file", path])
+        strings_raw = _run_cmd(["strings", "-n", "6", path])
+
+        # تحليل منظم بـ pyelftools
+        sections = []
+        imports  = []
+        exports  = []
+        arch     = None
+        entry    = None
+
+        try:
+            from elftools.elf.elffile import ELFFile
+            from elftools.elf.sections import SymbolTableSection
+
+            with open(path, "rb") as f:
+                elf = ELFFile(f)
+                arch  = elf.get_machine_arch()
+                entry = hex(elf.header.e_entry)
+
+                for s in elf.iter_sections():
+                    sections.append({
+                        "name":   s.name,
+                        "type":   s["sh_type"],
+                        "size":   s["sh_size"],
+                        "offset": hex(s["sh_offset"]),
+                        "addr":   hex(s["sh_addr"]),
+                    })
+
+                for s in elf.iter_sections():
+                    if isinstance(s, SymbolTableSection):
+                        for sym in s.iter_symbols():
+                            if not sym.name:
+                                continue
+                            bind = sym.entry.st_info.bind
+                            if sym.entry.st_shndx == "SHN_UNDEF":
+                                imports.append(sym.name)
+                            elif bind in ("STB_GLOBAL", "STB_WEAK"):
+                                exports.append(sym.name)
+
+        except ImportError:
+            pass  # pyelftools غير متاح، نرجع النتائج الخام
+
+        strings_list = [s for s in strings_raw.splitlines() if len(s) > 5]
+
+        return {
+            "success": True,
+            "arch": arch,
+            "entry_point": entry,
+            "file_info": file_info,
+            "section_count": len(sections),
+            "sections": sections[:50],
+            "export_count": len(exports),
+            "exports": exports[:100],
+            "import_count": len(imports),
+            "imports": imports[:100],
+            "readable_strings": strings_list[:150],
+            "tip": "استخدم patch_so_bytes لتعديل offset محدد، أو patch_so_string لاستبدال نص.",
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def analyze_so_url(url: str) -> dict:
+    """
+    يحلل ملف .so (ELF shared library) من رابط تحميل مباشر.
+    يرجع: المعمارية، entry point، الـ sections، الدوال المصدّرة (exports)،
+    الدوال المستوردة (imports)، والنصوص القابلة للقراءة (strings).
+    ابدأ دائماً بهذه الأداة قبل أي تعديل لفهم بنية الملف.
+    """
+    return _analyze_so_impl(url)
+
+
+def _patch_so_bytes_impl(url: str, offset_hex: str, new_bytes_hex: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=50)
+        if err:
+            return err
+
+        try:
+            offset    = int(offset_hex, 16)
+            new_bytes = bytes.fromhex(new_bytes_hex.replace(" ", ""))
+        except ValueError as e:
+            return {"success": False, "error": f"قيمة offset أو bytes غير صحيحة: {e}"}
+
+        with open(path, "rb") as f:
+            original = bytearray(f.read())
+
+        file_size = len(original)
+        if offset + len(new_bytes) > file_size:
+            return {"success": False, "error": f"الـ offset ({hex(offset)}) يتجاوز حجم الملف ({file_size} bytes)."}
+
+        old_bytes = bytes(original[offset: offset + len(new_bytes)])
+        original[offset: offset + len(new_bytes)] = new_bytes
+
+        patched_path = os.path.join(tmp_dir, "patched.so")
+        with open(patched_path, "wb") as f:
+            f.write(original)
+
+        # رفع الملف المعدّل
+        _cleanup_old_downloads()
+        file_id = f"{uuid.uuid4().hex[:12]}_patched.so"
+        dest = os.path.join(DOWNLOADS_DIR, file_id)
+        shutil.copy(patched_path, dest)
+
+        return {
+            "success": True,
+            "offset": offset_hex,
+            "original_bytes": old_bytes.hex(),
+            "new_bytes": new_bytes_hex.replace(" ", ""),
+            "bytes_changed": len(new_bytes),
+            "download_url": f"{PUBLIC_BASE_URL}/downloads/{file_id}",
+            "note": "الرابط صالح لمدة ساعة. تحقق من الملف قبل إعادة التجميع.",
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def patch_so_bytes(url: str, offset_hex: str, new_bytes_hex: str) -> dict:
+    """
+    يعدّل bytes محددة في ملف .so بالموضع (offset) ويرجع الملف المعدّل.
+    url: رابط ملف .so الأصلي
+    offset_hex: الموضع كـ hex مثل "0x1a2b"
+    new_bytes_hex: الـ bytes الجديدة كـ hex مثل "9090" (NOP NOP في x86)
+    استخدم analyze_so_url أولاً لمعرفة الـ offsets الصحيحة.
+    """
+    return _patch_so_bytes_impl(url, offset_hex, new_bytes_hex)
+
+
+def _patch_so_string_impl(url: str, old_string: str, new_string: str) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(url, tmp_dir, max_mb=50)
+        if err:
+            return err
+
+        with open(path, "rb") as f:
+            data = bytearray(f.read())
+
+        old_b = old_string.encode("utf-8")
+        new_b = new_string.encode("utf-8")
+
+        if len(new_b) > len(old_b):
+            return {
+                "success": False,
+                "error": (
+                    f"النص الجديد ({len(new_b)} bytes) أطول من الأصلي ({len(old_b)} bytes). "
+                    "يجب أن يكون بنفس الطول أو أقصر (يُكمَّل بـ null bytes)."
+                ),
+            }
+
+        idx = data.find(old_b)
+        if idx == -1:
+            return {"success": False, "error": f"لم يُعثر على النص '{old_string}' في الملف."}
+
+        # استبدال مع padding بـ null bytes
+        padded = new_b + b"\x00" * (len(old_b) - len(new_b))
+        data[idx: idx + len(old_b)] = padded
+
+        # حفظ ورفع
+        patched_path = os.path.join(tmp_dir, "patched.so")
+        with open(patched_path, "wb") as f:
+            f.write(data)
+
+        _cleanup_old_downloads()
+        file_id = f"{uuid.uuid4().hex[:12]}_strpatch.so"
+        dest = os.path.join(DOWNLOADS_DIR, file_id)
+        shutil.copy(patched_path, dest)
+
+        # التحقق من وجود نسخ أخرى من نفس النص
+        remaining = data.count(old_b)
+
+        return {
+            "success": True,
+            "found_at_offset": hex(idx),
+            "old_string": old_string,
+            "new_string": new_string,
+            "remaining_occurrences": remaining,
+            "download_url": f"{PUBLIC_BASE_URL}/downloads/{file_id}",
+            "note": (
+                "الرابط صالح لمدة ساعة. "
+                + (f"تنبيه: يوجد {remaining} نسخة أخرى من نفس النص في الملف." if remaining > 0 else "لا توجد نسخ أخرى من النص.")
+            ),
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def patch_so_string(url: str, old_string: str, new_string: str) -> dict:
+    """
+    يبحث عن نص (string) داخل ملف .so ويستبدله بنص جديد،
+    ويرجع الملف المعدّل كرابط تحميل.
+    النص الجديد يجب أن يكون بنفس طول الأصلي أو أقصر.
+    مفيد لتغيير URLs أو رسائل أو معرّفات داخل المكتبة.
+    """
+    return _patch_so_string_impl(url, old_string, new_string)
+
+
+def _extract_so_from_apk_impl(apk_url: str, arch: str = None) -> dict:
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        path, err = _download_to_temp(apk_url, tmp_dir, max_mb=100)
+        if err:
+            return err
+
+        if not zipfile.is_zipfile(path):
+            return {"success": False, "error": "الملف ليس APK صالح (يجب أن يكون ZIP)."}
+
+        found = []
+        with zipfile.ZipFile(path) as zf:
+            for item in zf.infolist():
+                if not item.filename.endswith(".so"):
+                    continue
+                if arch and arch not in item.filename:
+                    continue
+
+                extract_dir = os.path.join(tmp_dir, "apk_out")
+                os.makedirs(extract_dir, exist_ok=True)
+                zf.extract(item, extract_dir)
+                so_path = os.path.join(extract_dir, item.filename)
+
+                _cleanup_old_downloads()
+                file_id = f"{uuid.uuid4().hex[:8]}_{os.path.basename(item.filename)}"
+                dest = os.path.join(DOWNLOADS_DIR, file_id)
+                shutil.copy(so_path, dest)
+
+                found.append({
+                    "name": os.path.basename(item.filename),
+                    "path_in_apk": item.filename,
+                    "size_kb": round(item.file_size / 1024, 1),
+                    "download_url": f"{PUBLIC_BASE_URL}/downloads/{file_id}",
+                })
+
+        if not found:
+            msg = "لم يُعثر على ملفات .so"
+            if arch:
+                msg += f" للمعمارية '{arch}'"
+            msg += ". المعماريات الشائعة: arm64-v8a, armeabi-v7a, x86, x86_64"
+            return {"success": False, "error": msg}
+
+        return {
+            "success": True,
+            "so_count": len(found),
+            "files": found,
+            "next_step": "استخدم analyze_so_url لتحليل أي ملف، أو patch_so_bytes/patch_so_string للتعديل.",
+            "note": "الروابط صالحة لمدة ساعة.",
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def extract_so_from_apk(apk_url: str, arch: str = None) -> dict:
+    """
+    يستخرج ملفات .so من داخل APK ويرجع رابط تحميل لكل ملف.
+    apk_url: رابط ملف APK
+    arch: اختياري لتصفية معمارية معينة مثل "arm64-v8a" أو "armeabi-v7a"
+    بعد الاستخراج استخدم analyze_so_url لتحليل الملف،
+    ثم patch_so_bytes أو patch_so_string للتعديل.
+    """
+    return _extract_so_from_apk_impl(apk_url, arch)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# نقطة تحميل الملفات المُنشأة
+# ──────────────────────────────────────────────────────────────────────
+
 @mcp.custom_route("/downloads/{file_id}", methods=["GET"])
 async def download_file(request):
     from starlette.responses import FileResponse, JSONResponse
     file_id = request.path_params.get("file_id", "")
-    # حماية بسيطة من الهروب خارج مجلد التحميلات
     safe_id = os.path.basename(file_id)
     file_path = os.path.join(DOWNLOADS_DIR, safe_id)
     if not os.path.isfile(file_path):
-        return JSONResponse({"success": False, "error": "الملف غير موجود أو انتهت صلاحيته (بعد ساعة تقريباً)."}, status_code=404)
-    return FileResponse(file_path, media_type="application/zip", filename=safe_id)
+        return JSONResponse({"success": False, "error": "الملف غير موجود أو انتهت صلاحيته."}, status_code=404)
+    # تحديد نوع المحتوى
+    if safe_id.endswith(".so"):
+        media_type = "application/octet-stream"
+    else:
+        media_type = "application/zip"
+    return FileResponse(file_path, media_type=media_type, filename=safe_id)
 
 
-# ----------------------------------------------------------------------
-# نقاط REST عادية (GET) — لتُستخدم إذا كان لدى genspark ميزة عامة
-# "قراءة رابط" تفتح أي URL وتقرأ محتواه، بدل بروتوكول MCP الكامل.
-# مثال: GET /api/analyze-video?url=https://youtu.be/xxxx
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# نقاط REST عادية (GET)
+# ──────────────────────────────────────────────────────────────────────
+
 @mcp.custom_route("/api/analyze-video", methods=["GET"])
 async def api_analyze_video(request):
     from starlette.responses import JSONResponse
@@ -909,7 +1092,6 @@ async def api_analyze_video(request):
     if not url:
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_analyze_video_url_impl(url))
-
 
 @mcp.custom_route("/api/extract-archive", methods=["GET"])
 async def api_extract_archive(request):
@@ -919,7 +1101,6 @@ async def api_extract_archive(request):
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_extract_archive_impl(url))
 
-
 @mcp.custom_route("/api/analyze-image", methods=["GET"])
 async def api_analyze_image(request):
     from starlette.responses import JSONResponse
@@ -927,7 +1108,6 @@ async def api_analyze_image(request):
     if not url:
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_analyze_image_impl(url))
-
 
 @mcp.custom_route("/api/ocr-image", methods=["GET"])
 async def api_ocr_image(request):
@@ -937,7 +1117,6 @@ async def api_ocr_image(request):
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_ocr_image_impl(url))
 
-
 @mcp.custom_route("/api/analyze-audio", methods=["GET"])
 async def api_analyze_audio(request):
     from starlette.responses import JSONResponse
@@ -945,7 +1124,6 @@ async def api_analyze_audio(request):
     if not url:
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_analyze_audio_impl(url))
-
 
 @mcp.custom_route("/api/read-document", methods=["GET"])
 async def api_read_document(request):
@@ -955,7 +1133,6 @@ async def api_read_document(request):
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_read_document_impl(url))
 
-
 @mcp.custom_route("/api/analyze-apk", methods=["GET"])
 async def api_analyze_apk(request):
     from starlette.responses import JSONResponse
@@ -963,7 +1140,6 @@ async def api_analyze_apk(request):
     if not url:
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_analyze_apk_impl(url))
-
 
 @mcp.custom_route("/api/fetch-webpage", methods=["GET"])
 async def api_fetch_webpage(request):
@@ -973,11 +1149,9 @@ async def api_fetch_webpage(request):
         return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
     return JSONResponse(_fetch_webpage_impl(url))
 
-
 @mcp.custom_route("/api/text-to-speech", methods=["GET"])
 async def api_text_to_speech(request):
     from starlette.responses import JSONResponse
-    import base64
     text = request.query_params.get("text")
     lang = request.query_params.get("lang", "ar")
     if not text:
@@ -991,32 +1165,44 @@ async def api_text_to_speech(request):
         "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
     })
 
+@mcp.custom_route("/api/analyze-so", methods=["GET"])
+async def api_analyze_so(request):
+    from starlette.responses import JSONResponse
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({"success": False, "error": "مطلوب باراميتر url"}, status_code=400)
+    return JSONResponse(_analyze_so_impl(url))
 
-# ----------------------------------------------------------------------
-# نقطة فحص صحة السيرفر (يُستخدم للتأكد أنه يعمل قبل ربطه بـ genspark)
-# ----------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────
+# نقطة فحص صحة السيرفر
+# ──────────────────────────────────────────────────────────────────────
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request):
     from starlette.responses import JSONResponse
     return JSONResponse({
         "status": "ok",
-        "mcp_tools": [
-            "analyze_video_url", "transcribe_video_url", "extract_video_frames",
-            "extract_archive", "create_archive", "analyze_image_url", "ocr_image_url",
-            "analyze_audio_url", "read_document_url", "analyze_apk_url",
-            "fetch_webpage_url", "text_to_speech", "generate_image", "generate_video",
+        "tools": [
+            "analyze_video_url",
+            "transcribe_video_url",
+            "extract_video_frames",
+            "extract_archive",
+            "create_archive",
+            "analyze_image_url",
+            "ocr_image_url",
+            "analyze_audio_url",
+            "read_document_url",
+            "analyze_apk_url",
+            "fetch_webpage_url",
+            "text_to_speech",
+            "generate_image",
+            "generate_video",
+            # أدوات .so الجديدة
+            "analyze_so_url",
+            "patch_so_bytes",
+            "patch_so_string",
+            "extract_so_from_apk",
         ],
-        "rest_endpoints": [
-            "/api/analyze-video?url=...", "/api/extract-archive?url=...",
-            "/api/analyze-image?url=...", "/api/ocr-image?url=...",
-            "/api/analyze-audio?url=...", "/api/read-document?url=...",
-            "/api/analyze-apk?url=...", "/api/fetch-webpage?url=...",
-            "/api/text-to-speech?text=...&lang=ar",
-        ],
+        "version": "2.1.0",
     })
-
-
-if __name__ == "__main__":
-    # streamable-http = بروتوكول MCP عبر HTTP، هذا ما تحتاجه genspark كسيرفر MCP خارجي (remote)
-    # ملاحظة: host/port يُقرآن من إعداد FastMCP نفسه أعلاه (وليس من run())
-    mcp.run(transport="streamable-http")

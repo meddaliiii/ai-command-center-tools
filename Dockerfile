@@ -11,13 +11,17 @@ COPY --from=node_base /usr/local/bin/node /usr/local/bin/node
 COPY --from=node_base /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 
-# برامج النظام المطلوبة لدعم RAR وOCR (عربي + إنجليزي) والتحويل الصوتي المحلي
+# برامج النظام المطلوبة
 RUN apt-get update && apt-get install -y --no-install-recommends \
     unrar-free \
     tesseract-ocr \
     tesseract-ocr-ara \
     espeak-ng \
     ffmpeg \
+    radare2 \
+    patchelf \
+    binutils \
+    file \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
